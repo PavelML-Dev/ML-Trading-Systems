@@ -273,7 +273,7 @@ var array<float> delta_hidden = array.new_float(lstm_timesteps * lstm_hidden_siz
 var array<float> delta_cell = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
 
 // 2. Адаптивный расчет периода обучения
-max_training_bars = 2000
+max_training_bars = 5000
 training_period = auto_train ? math.min(math.max(bar_index, min_train_bars), max_training_bars) : math.min(training_period_input, max_training_bars)
 
 // 3. Выбор источника цены
@@ -1078,9 +1078,6 @@ rl_prevA := rl_act
 //******************************************************************************************************************************************************
 [st, dir_val] = pine_supertrend(final_factor, final_centroid)
 
-bool useEarlySignals = input.bool(true, "Use Early Signals (Realtime)", 
-                                   tooltip="true = Ранние сигналы внутри бара (только realtime)\nfalse = Обычные сигналы на закрытии бара (вся история)", 
-                                   group="Signal Settings")
 
 bool crossUp = close > st and close[1] <= st[1]
 bool crossDown = close < st and close[1] >= st[1]
@@ -1090,102 +1087,6 @@ bool crossDown = close < st and close[1] >= st[1]
 // ========================================
 bool buy_signal = crossUp and barstate.isconfirmed and not na(final_centroid)
 bool sell_signal = crossDown and barstate.isconfirmed and not na(final_centroid)
-
-// ========================================
-// БЛОК: POSITION (работает ВСЕГДА)
-// ========================================
-var int position_history = 0
-varip int position_realtime = 0
-
-bool isEarlyBar = barstate.isrealtime and not barstate.isconfirmed
-
-if crossUp and not na(final_centroid)
-    position_history := 1
-    if isEarlyBar
-        position_realtime := 1
-    
-if crossDown and not na(final_centroid)
-    position_history := -1
-    if isEarlyBar
-        position_realtime := -1
-
-if barstate.isnew
-    position_realtime := position_history
-
-int position_early = barstate.isrealtime ? position_realtime : position_history
-
-// ========================================
-// EARLY СИГНАЛЫ С АВТОМАТИЧЕСКОЙ СМЕНОЙ
-// ========================================
-varip bool buy_signal_early = false
-varip bool sell_signal_early = false
-varip int last_position = 0
-varip int signal_changes = 0  // Счетчик смен сигнала на одном баре
-
-// Триггеры
-bool buy_trigger_early = crossUp and isEarlyBar and not na(final_centroid)
-bool sell_trigger_early = crossDown and isEarlyBar and not na(final_centroid)
-
-// ОСНОВНАЯ ЛОГИКА: Прямое срабатывание с автоматической отменой противоположного
-if buy_trigger_early
-    // Если был SELL сигнал - засчитываем смену
-    if sell_signal_early
-        signal_changes += 1
-    
-    buy_signal_early := true
-    sell_signal_early := false  // АВТОМАТИЧЕСКИ ОТМЕНЯЕМ ПРОТИВОПОЛОЖНЫЙ
-
-if sell_trigger_early
-    // Если был BUY сигнал - засчитываем смену
-    if buy_signal_early
-        signal_changes += 1
-    
-    sell_signal_early := true
-    buy_signal_early := false  // АВТОМАТИЧЕСКИ ОТМЕНЯЕМ ПРОТИВОПОЛОЖНЫЙ
-
-// ЗАЩИТА 2: Дублирование через изменение позиции
-if isEarlyBar and position_realtime != last_position
-    if position_realtime == 1 and last_position != 1
-        if sell_signal_early
-            signal_changes += 1
-        buy_signal_early := true
-        sell_signal_early := false
-        
-    if position_realtime == -1 and last_position != -1
-        if buy_signal_early
-            signal_changes += 1
-        sell_signal_early := true
-        buy_signal_early := false
-        
-    last_position := position_realtime
-
-// ЗАЩИТА 3: Синхронизация с позицией (failsafe)
-if isEarlyBar and position_realtime == 1 and not buy_signal_early and not sell_signal_early
-    buy_signal_early := true
-
-if isEarlyBar and position_realtime == -1 and not sell_signal_early and not buy_signal_early
-    sell_signal_early := true
-
-// Сброс при новом баре
-if barstate.isnew
-    buy_signal_early := false
-    sell_signal_early := false
-    last_position := 0
-    signal_changes := 0  // Сбрасываем счетчик смен
-
-// ========================================
-// СЧЕТЧИКИ ДЛЯ ДИАГНОСТИКИ
-// ========================================
-varip int buy_count = 0
-varip int sell_count = 0
-varip int total_ticks = 0
-
-if isEarlyBar
-    total_ticks += 1
-    if buy_trigger_early
-        buy_count += 1
-    if sell_trigger_early
-        sell_count += 1
 
 //***********************************************************************************************************************************************************
 var array<State> state_seq = array.new<State>()
@@ -1977,9 +1878,7 @@ else if sell_signal
 plotshape(buy_signal, text="Long", textcolor=color.white, style=shape.labelup, location=location.belowbar, color=color_bull, size=size.tiny)
 plotshape(sell_signal, text="Short", textcolor=color.white, style=shape.labeldown, location=location.abovebar, color=color_bear, size=size.tiny)
 
-plotshape(useEarlySignals and buy_signal_early, "EARLY BUY", shape.triangleup, location.belowbar, color.aqua, size=size.small, text="E")
-plotshape(useEarlySignals and sell_signal_early, "EARLY SELL", shape.triangledown, location.abovebar, color.fuchsia, size=size.small, text="E")
-bgcolor(position_early == 1 ? color.new(color.green, 90) : position_early == -1 ? color.new(color.red, 90) : na)
+bgcolor(dir_val == -1 ? color.new(color.green, 90) : dir_val == 1 ? color.new(color.red, 90) : na)
 // =================== ДИАГНОСТИКА С L2 МОНИТОРИНГОМ ===================
               
 // 16. Информационная панель
