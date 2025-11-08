@@ -1919,14 +1919,14 @@ if initialization_stage == 3 and km_kmeans_ok
         km_reinitialized_now := false
 // === СЕКЦИЯ ПРОГНОЗИРОВАНИЯ (УЛУЧШЕННАЯ + Walk-Forward IS/OOS + SVR + XGB + LightGBM, ОПТИМИЗИРОВАННАЯ ПОД ММВБ) ===
 
-// === Входные параметры ===
-regression_length = input.int(30, "Длина регрессии", minval=10, maxval=200)
-forecast_length = input.int(3, "Горизонт прогноза", minval=1, maxval=20)
-walk_is_len = input.int(150, "Длина окна IS", minval=20)
-history_len = input.int(60, "Длина истории ошибок", minval=10, maxval=100)
-vol_adapt_coeff = input.float(4.0, "Коэффициент адаптации волатильности", minval=1.0, maxval=10.0)
-trust_mult_base = input.float(1.2, "Базовый множитель доверия", minval=1.0, maxval=2.0)
-err_influence = input.float(1.2, "Влияние ошибки на диапазон", minval=0.5, maxval=2.0)
+// === Input Parameters ===
+regression_length = input.int(30, "Regression Length", minval=10, maxval=200)
+forecast_length = input.int(3, "Forecast Horizon", minval=1, maxval=20)
+walk_is_len = input.int(150, "IS Window Length", minval=20)
+history_len = input.int(60, "Error History Length", minval=10, maxval=100)
+vol_adapt_coeff = input.float(4.0, "Volatility Adaptation Coefficient", minval=1.0, maxval=10.0)
+trust_mult_base = input.float(1.2, "Base Trust Multiplier", minval=1.0, maxval=2.0)
+err_influence = input.float(1.2, "Error Influence on Range", minval=0.5, maxval=2.0)
 threshold_bb = input.float(0.02, "BB Width Threshold", minval=0.01, maxval=0.05)
 threshold_adx = input.float(25.0, "ADX Threshold", minval=15.0, maxval=35.0)
 
@@ -4776,3 +4776,4 @@ bg_color =
 barcolor(bar_color)
 bgcolor(bg_color)
 //**********************************************************************************************************************************************************
+
