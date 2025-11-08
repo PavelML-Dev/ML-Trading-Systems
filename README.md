@@ -137,15 +137,6 @@ Instead of static parameters:
 4. Click "Add to Chart"
 5. Adjust parameters as needed
 
-### GitHub
-# 🚀 6-Model ML Ensemble: Institutional-Grade Forecasting on Pine Script
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-blue.svg)](https://www.tradingview.com/pine-script-docs/)
-[![TradingView](https://img.shields.io/badge/TradingView-Published-green.svg)](https://www.tradingview.com/)
-
-**Not just a forecasting tool.** A self-learning ensemble system that adapts to market conditions in real-time.
-
 
 
 
