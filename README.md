@@ -167,17 +167,17 @@ Training Frequency: Every 10 bars
 
 ```yaml
 LSTM:
-  Hidden Size: 64 (default, configurable)
+  Hidden Size: 8 (default, configurable)
   Timesteps: 8-20 (dynamic)
   Gates: Forget, Input, Cell, Output
   Activation: tanh (gates), sigmoid (cell)
 
 MLP (DQN):
   Input: 20 features
-  Layer 1: 128 neurons (Leaky ReLU)
-  Layer 2: 64 neurons (Leaky ReLU)
-  Layer 3: 32 neurons (Leaky ReLU)
-  Layer 4: 16 neurons (Leaky ReLU)
+  Layer 1: 24 neurons (Leaky ReLU)
+  Layer 2: 16 neurons (Leaky ReLU)
+  Layer 3: 8 neurons (Leaky ReLU)
+  Layer 4: 4 neurons (Leaky ReLU)
   Output: 8 Q-values (linear)
 
 Dropout: 0.3
@@ -188,7 +188,7 @@ L2 Lambda: 0.0008 (MLP), 0.0003 (LSTM)
 
 ```yaml
 Buffer Size: 70,000 transitions
-Batch Size: 8 samples
+Batch Size: 6 samples
 Priority Alpha (α): 0.6
 Priority Beta (β): 0.4 → 1.0 (annealing)
 Priority Epsilon: 1e-5
