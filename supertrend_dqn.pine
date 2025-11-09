@@ -1,5 +1,6 @@
 //@version=6
 indicator("ML SuperTrend (Ultimate) - Auto-Optimized AI with LSTM", overlay=true, max_labels_count=100, max_lines_count=500, max_bars_back=5000)
+
 // 1. Параметры (ОПТИМИЗИРОВАННЫЕ)
 resample_freq = input.int(3, "Resample Frequency", minval=1, maxval=10, group="Optimization")
 atr_length = input.int(12, "ATR Length", group="SuperTrend", minval=1)
@@ -12,11 +13,13 @@ debug_mode = input.bool(false, "Enable Debug Info", group="Debug")
 color_bull = input.color(color.new(color.green, 0), "Bullish Color", group="Visual")
 color_bear = input.color(color.new(color.red, 0), "Bearish Color", group="Visual")
 norm_length = input.int(100, "Normalization Length", minval=10, maxval=500, group="Neural Network")
+// В блоке inputs (где остальные настройки)
+show_debug = input.bool(false, "Show Debug Panel for Neural Network", group="ML Settings")
+
 //**********************************************************************************************************************************************
 // --- Новые inputs для улучшения отзывчивости (вставь в начало, с остальными input) ---
 use_roc_adapt = input.bool(true, "Use ROC for Adaptive Factor", group="SuperTrend")
 roc_length = input.int(5, "ROC Length for Volatility", minval=3, group="SuperTrend")
-//ema_length = input.int(3, "EMA Smoothing for Index", minval=1, group="SuperTrend")
 
 // 1.1. Параметры точности
 //use_adaptive_vol_filter = input.bool(true, "Use Adaptive Volatility Filter", group="Accuracy Boost")
@@ -27,8 +30,6 @@ auto_optimize = input.bool(true, "Auto-Optimize Training", group="Accuracy Boost
 // 1.2. Оптимизация ML параметров
 auto_train = input.bool(true, "Auto Training Period", group="ML Settings")
 min_train_bars = input.int(250, "Min Training Bars", minval=10, maxval=4000, group="ML Settings")
-//var float lr_decay = input.float(0.99, "Learning Rate Decay", minval=0.9, maxval=1.0, step=0.01, group="Neural Network")
-//var int lr_update_period = input.int(20, "LR Update Period", minval=10, maxval=100, group="Neural Network")
 var float learning_rate = input.float(0.01, "Initial Learning Rate", group="Neural Network", step=0.001)
 //****************************************************************************************************************
 // =================== ПАРАМЕТРЫ РЕГУЛЯЦИИ ===================
@@ -60,10 +61,9 @@ var int adam_timestep = 0
 // 🆕 Параметры для LSTM
 lstm_hidden_size = input.int(8, "LSTM Hidden Size", minval=1, maxval=32, group="Neural Network")
 use_lstm = input.bool(true, "Use LSTM Layer", group="Neural Network")
-//lstm_timesteps = input.int(5, "LSTM Time Steps", minval=1, maxval=10, group="Neural Network")  // Глубина последовательности
-//lstm_learning_rate = input.float(0.001, "LSTM Learning Rate", step=0.001, group="Neural Network")
 //***************************************************************************************************************************************************
-
+var float sum_abs_td_error_total = 0.0  // 🆕 Глобальная переменная
+var int td_error_count = 0               // 🆕 Счетчик TD-errors
 // --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ ---
 // Переменные состояния (var) должны иметь начальное значение.
 // Мы установим их на 0.0, предполагая, что они будут обновлены позже.
@@ -92,7 +92,6 @@ float vol_std = ta.stdev(atr_val, vol_std_length)
 float threshold = input.float(0.1, "Нормализованный порог ATR", minval=0.01, group="C. Логика Адаптации")
 float step_factor = input.float(2.0, "Множитель шага (ATR)", minval=1.0, group="C. Логика Адаптации")
 
-// NEW: Состояния для chaotic mapping и cuckoo (добавлены после существующих var)
 // Гистерезис ATR
 int min_bars_between_changes = 5
 var int bars_since_change = 0 
@@ -288,6 +287,7 @@ safe_smooth_vol = math.max(nz(smooth_vol, ta.tr), 0.0001)
 filtered_vol = math.max(safe_smooth_vol, ta.ema(volatility, 5) * vol_filter)
 //******************************************************************************************************************************
 
+//*********************************************************************************************************************************
 // 2. КЭШИРОВАНИЕ
 var array<float> htf_values_cached = array.new<float>(5, na)
 var int last_htf_bar_idx = -1
@@ -589,45 +589,75 @@ raw_input9_stoch_d := d / 100 // Нормализация (не использу
 raw_obv_roc := ta.roc(ta.obv, 1)
 raw_vwap_diff := (close - ta.vwap) / ta.atr(20)
 raw_hurst_proxy := ta.stdev(close, 50) / ta.ema(close, 50)
+// ╔════════════════════════════════════════════════════════╗
+// ║ УЛУЧШЕННЫЙ CNN ФИЛЬТР (Dual-Kernel)                    ║
+// ╚════════════════════════════════════════════════════════╝
 
-// CNN-подобный фильтр (raw_input7)
-var float[] window_changes = array.new_float(0)
-var float[] convolved_results = array.new_float(0)
-float pooled_feature = 0.0
-// ИТОГОВЫЙ КОД (просто скопируй):
-
+// HELPER ФУНКЦИЯ: Z-Score
 f_zscore(value, length) =>
     mean = ta.sma(value, length)
     dev = ta.stdev(value, length)
     dev > 0 ? (value - mean) / dev : 0.0
 
+// ═══ CNN ФИЛЬТР (УЛУЧШЕННЫЙ) ═══
+
+// Параметры (добавь в inputs)
+cnn_short_window = input.int(5, "CNN Short Window", minval=2, maxval=10, group="CNN Filter")
+cnn_long_window = input.int(10, "CNN Long Window", minval=5, maxval=20, group="CNN Filter")
+cnn_use_dual = input.bool(true, "Use Dual Kernel", group="CNN Filter")
+
 var float raw_input7 = 0.0
 
 if use_cnn_filter
-    window_changes := array.new<float>()
+    // ═══ KERNEL 1: КРАТКОСРОЧНЫЕ ИЗМЕНЕНИЯ (быстрые спайки) ═══
+    var array<float> window_short = array.new<float>()
+    array.clear(window_short)
     
-    for i = 0 to math.min(cnn_window_size - 1, 10)
+    for i = 0 to math.min(cnn_short_window - 1, 5)
         if i + 1 <= bar_index
-            array.push(window_changes, close[i] - close[i+1])  // ← close[i]!
+            array.push(window_short, close[i] - close[i+1])
     
-    int conv_size = array.size(window_changes)
-    if conv_size >= 3
-        float max_conv = 0.0
-        for i = 0 to math.min(conv_size - 1, 5)
-            float weight = math.pow(0.9, float(i))
-            float weighted = array.get(window_changes, i) * weight
-            max_conv = math.max(max_conv, weighted)
+    float max_conv_short = 0.0
+    if array.size(window_short) >= 2
+        for i = 0 to array.size(window_short) - 1
+            // Экспоненциальные веса: 0.9^i
+            float weight_short = math.pow(0.9, float(i))
+            float weighted_short = array.get(window_short, i) * weight_short
+            max_conv_short = math.max(max_conv_short, math.abs(weighted_short))  // ← ABS для обоих направлений!
+    
+    // ═══ KERNEL 2: ДОЛГОСРОЧНЫЕ ТРЕНДЫ (медленные движения) ═══
+    var array<float> window_long = array.new<float>()
+    array.clear(window_long)
+    
+    if cnn_use_dual
+        for i = 0 to math.min(cnn_long_window - 1, 10)
+            if i + 1 <= bar_index
+                array.push(window_long, close[i] - close[i+1])
         
-        pooled_feature := max_conv
-        raw_input7 := f_zscore(pooled_feature, 20)  // ← Z-score один раз
+        float max_conv_long = 0.0
+        if array.size(window_long) >= 3
+            for i = 0 to array.size(window_long) - 1
+                // Более слабые веса для долгосрочных
+                float weight_long = math.pow(0.85, float(i))  // ← 0.85 вместо 0.9
+                float weighted_long = array.get(window_long, i) * weight_long
+                max_conv_long = math.max(max_conv_long, math.abs(weighted_long))  // ← ABS!
         
-        if na(raw_input7)
-            raw_input7 := 0.0
+        // ═══ КОМБИНИРОВАНИЕ ДВУХ ЯДЕР ═══
+        // Взвешиваем: короткие 70%, длинные 30%
+        float pooled_feature = (max_conv_short * 0.7 + max_conv_long * 0.3)
+        
+        // Нормализация
+        raw_input7 := f_zscore(pooled_feature, 20)
     else
+        // Если не используем dual kernel
+        float pooled_feature = max_conv_short
+        raw_input7 := f_zscore(pooled_feature, 20)
+    
+    // Защита от NaN
+    if na(raw_input7)
         raw_input7 := 0.0
 else
     raw_input7 := 0.0
-
 
 // Z-score нормализация входов
 float input1 = ta.stdev(raw_input1, norm_length) > 0 ? (raw_input1 - ta.sma(raw_input1, norm_length)) / ta.stdev(raw_input1, norm_length) : 0.0
@@ -645,11 +675,7 @@ float hurst_proxy = ta.stdev(raw_hurst_proxy, norm_length) > 0 ? (raw_hurst_prox
 float heidelberg_vol = ta.stdev(raw_heidelberg_vol, norm_length) > 0 ? (raw_heidelberg_vol - ta.sma(raw_heidelberg_vol, norm_length)) / ta.stdev(raw_heidelberg_vol, norm_length) : 0.0
 // 🆕 Нормализация ишимоку
 float  ichi_cloud_diff = ta.stdev(raw_ichi_cloud_diff, norm_length) != 0 ? (raw_ichi_cloud_diff - ta.sma(raw_ichi_cloud_diff, norm_length)) / ta.stdev(raw_ichi_cloud_diff, norm_length) : 0.0
-//float  ichi_conversion_base_diff = ta.stdev(raw_ichi_conversion_base_diff, norm_length) != 0 ? (raw_ichi_conversion_base_diff - ta.sma(raw_ichi_conversion_base_diff, norm_length)) / ta.stdev(raw_ichi_conversion_base_diff, norm_length) : 0.0
-//float  ichi_price_cloud_position_norm = raw_ichi_price_cloud_position  // Бинарное, без нормализации
-//float  ichi_chikou_confirmation_norm = raw_ichi_chikou_confirmation
-//float  ichi_htf_diff_norm = ta.stdev(raw_ichi_htf_diff, norm_length) != 0 ? (raw_ichi_htf_diff - ta.sma(raw_ichi_htf_diff, norm_length)) / ta.stdev(raw_ichi_htf_diff, norm_length) : 0.0
-//float  ichi_vol_adjusted_norm = ta.stdev(raw_ichi_vol_adjusted, norm_length) != 0 ? (raw_ichi_vol_adjusted - ta.sma(raw_ichi_vol_adjusted, norm_length)) / ta.stdev(raw_ichi_vol_adjusted, norm_length) : 0.0
+
 
 // Собираем входы в массив (теперь с новыми фичами)
 float[] nn_inputs = array.new_float(input_size_nn4, 0.0)
@@ -666,12 +692,7 @@ array.set(nn_inputs, 9, obv_roc)
 array.set(nn_inputs, 10, vwap_diff)
 array.set(nn_inputs, 11, hurst_proxy)
 array.set(nn_inputs, 12, ichi_cloud_diff)  // Было ichi_feature1, теперь расширенная
-//array.set(nn_inputs, 13, ichi_conversion_base_diff)  // Было ichi_feature2, теперь расширенная
 array.set(nn_inputs, 13, heidelberg_vol)
-//array.set(nn_inputs, 15, ichi_price_cloud_position_norm)  // Новая: позиция цены относительно облака
-//array.set(nn_inputs, 16, ichi_chikou_confirmation_norm)   // Новая: подтверждение от Chikou
-//array.set(nn_inputs, 17, ichi_htf_diff_norm)              // Новая: разница с HTF облаком
-//array.set(nn_inputs, 18, ichi_vol_adjusted_norm)          // Новая: разница, нормализованная по волатильности
 array.set(nn_inputs, 14, 0.0)  // Резерв для будущих фич, если нужно
 
 // Position 15 remains 0 if not used
@@ -739,121 +760,306 @@ array<float> q_next = na
 float ignored1 = na 
 float ignored2 = na 
 var array<float> q_pred = na
+// =======================================================================
+// ИНИЦИАЛИЗАЦИЯ ВЕСОВ (ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ)
+// =======================================================================
+
+force_reinit = input.bool(false, "Force Reinit Weights", group="ML Settings")
+var bool weights_initialized = false
+
+bool should_init = (barstate.isfirst and not weights_initialized) or force_reinit
+
+if should_init
+    weights_initialized := true
+    
+    // ═══ MLP ВЕСА ═══
+    array.clear(weights_input_hidden1)
+    for i = 0 to (input_size_nn4 * hidden_neurons1_nn4) - 1
+        array.push(weights_input_hidden1, math.random(-0.1, 0.1))
+    array.clear(biases_hidden1)
+    for i = 0 to hidden_neurons1_nn4 - 1
+        array.push(biases_hidden1, 0.0)
+    
+    array.clear(weights_hidden1_hidden2)
+    for i = 0 to (hidden_neurons1_nn4 * hidden_neurons2_nn4) - 1
+        array.push(weights_hidden1_hidden2, math.random(-0.1, 0.1))
+    array.clear(biases_hidden2)
+    for i = 0 to hidden_neurons2_nn4 - 1
+        array.push(biases_hidden2, 0.0)
+    
+    array.clear(weights_hidden2_hidden3)
+    for i = 0 to (hidden_neurons2_nn4 * hidden_neurons3_nn4) - 1
+        array.push(weights_hidden2_hidden3, math.random(-0.1, 0.1))
+    array.clear(biases_hidden3)
+    for i = 0 to hidden_neurons3_nn4 - 1
+        array.push(biases_hidden3, 0.0)
+    
+    array.clear(weights_hidden3_hidden4)
+    for i = 0 to (hidden_neurons3_nn4 * hidden_neurons4_nn4) - 1
+        array.push(weights_hidden3_hidden4, math.random(-0.1, 0.1))
+    array.clear(biases_hidden4)
+    for i = 0 to hidden_neurons4_nn4 - 1
+        array.push(biases_hidden4, 0.0)
+    
+    array.clear(weights_hidden4_q)
+    for i = 0 to (hidden_neurons4_nn4 * num_actions) - 1
+        array.push(weights_hidden4_q, math.random(-0.1, 0.1))
+    array.clear(biases_q)
+    for i = 0 to num_actions - 1
+        array.push(biases_q, 0.0)
+    
+    // ═══ LSTM ВЕСА ═══
+    if use_lstm
+        array.clear(lstm_forget_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(lstm_forget_weights_i, math.random(-0.1, 0.1))
+        array.clear(lstm_forget_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_forget_weights_h, math.random(-0.1, 0.1))
+        array.clear(lstm_forget_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_forget_bias, 0.0)
+        
+        array.clear(lstm_input_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(lstm_input_weights_i, math.random(-0.1, 0.1))
+        array.clear(lstm_input_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_input_weights_h, math.random(-0.1, 0.1))
+        array.clear(lstm_input_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_input_bias, 0.0)
+        
+        array.clear(lstm_cell_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(lstm_cell_weights_i, math.random(-0.1, 0.1))
+        array.clear(lstm_cell_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_cell_weights_h, math.random(-0.1, 0.1))
+        array.clear(lstm_cell_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_cell_bias, 0.0)
+        
+        array.clear(lstm_output_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(lstm_output_weights_i, math.random(-0.1, 0.1))
+        array.clear(lstm_output_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_output_weights_h, math.random(-0.1, 0.1))
+        array.clear(lstm_output_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(lstm_output_bias, 0.0)
+    
+    // ═══ ADAM МОМЕНТЫ ДЛЯ MLP ═══
+    array.clear(m_weights_input_hidden1)
+    array.clear(v_weights_input_hidden1)
+    for i = 0 to (input_size_nn4 * hidden_neurons1_nn4) - 1
+        array.push(m_weights_input_hidden1, 0.0)
+        array.push(v_weights_input_hidden1, 0.0)
+    
+    array.clear(m_weights_hidden1_hidden2)
+    array.clear(v_weights_hidden1_hidden2)
+    for i = 0 to (hidden_neurons1_nn4 * hidden_neurons2_nn4) - 1
+        array.push(m_weights_hidden1_hidden2, 0.0)
+        array.push(v_weights_hidden1_hidden2, 0.0)
+    
+    array.clear(m_weights_hidden2_hidden3)
+    array.clear(v_weights_hidden2_hidden3)
+    for i = 0 to (hidden_neurons2_nn4 * hidden_neurons3_nn4) - 1
+        array.push(m_weights_hidden2_hidden3, 0.0)
+        array.push(v_weights_hidden2_hidden3, 0.0)
+    
+    array.clear(m_weights_hidden3_hidden4)
+    array.clear(v_weights_hidden3_hidden4)
+    for i = 0 to (hidden_neurons3_nn4 * hidden_neurons4_nn4) - 1
+        array.push(m_weights_hidden3_hidden4, 0.0)
+        array.push(v_weights_hidden3_hidden4, 0.0)
+    
+    array.clear(m_weights_hidden4_q)
+    array.clear(v_weights_hidden4_q)
+    for i = 0 to (hidden_neurons4_nn4 * num_actions) - 1
+        array.push(m_weights_hidden4_q, 0.0)
+        array.push(v_weights_hidden4_q, 0.0)
+    
+    // ═══ ADAM МОМЕНТЫ ДЛЯ LSTM ═══
+    if use_lstm
+        array.clear(m_lstm_forget_weights_i)
+        array.clear(v_lstm_forget_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(m_lstm_forget_weights_i, 0.0)
+            array.push(v_lstm_forget_weights_i, 0.0)
+        
+        array.clear(m_lstm_forget_weights_h)
+        array.clear(v_lstm_forget_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_forget_weights_h, 0.0)
+            array.push(v_lstm_forget_weights_h, 0.0)
+        
+        array.clear(m_lstm_forget_bias)
+        array.clear(v_lstm_forget_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_forget_bias, 0.0)
+            array.push(v_lstm_forget_bias, 0.0)
+        
+        array.clear(m_lstm_input_weights_i)
+        array.clear(v_lstm_input_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(m_lstm_input_weights_i, 0.0)
+            array.push(v_lstm_input_weights_i, 0.0)
+        
+        array.clear(m_lstm_input_weights_h)
+        array.clear(v_lstm_input_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_input_weights_h, 0.0)
+            array.push(v_lstm_input_weights_h, 0.0)
+        
+        array.clear(m_lstm_input_bias)
+        array.clear(v_lstm_input_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_input_bias, 0.0)
+            array.push(v_lstm_input_bias, 0.0)
+        
+        array.clear(m_lstm_cell_weights_i)
+        array.clear(v_lstm_cell_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(m_lstm_cell_weights_i, 0.0)
+            array.push(v_lstm_cell_weights_i, 0.0)
+        
+        array.clear(m_lstm_cell_weights_h)
+        array.clear(v_lstm_cell_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_cell_weights_h, 0.0)
+            array.push(v_lstm_cell_weights_h, 0.0)
+        
+        array.clear(m_lstm_cell_bias)
+        array.clear(v_lstm_cell_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_cell_bias, 0.0)
+            array.push(v_lstm_cell_bias, 0.0)
+        
+        array.clear(m_lstm_output_weights_i)
+        array.clear(v_lstm_output_weights_i)
+        for i = 0 to (lstm_hidden_size * input_dim) - 1
+            array.push(m_lstm_output_weights_i, 0.0)
+            array.push(v_lstm_output_weights_i, 0.0)
+        
+        array.clear(m_lstm_output_weights_h)
+        array.clear(v_lstm_output_weights_h)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_output_weights_h, 0.0)
+            array.push(v_lstm_output_weights_h, 0.0)
+        
+        array.clear(m_lstm_output_bias)
+        array.clear(v_lstm_output_bias)
+        for i = 0 to lstm_hidden_size - 1
+            array.push(m_lstm_output_bias, 0.0)
+            array.push(v_lstm_output_bias, 0.0)
+         
 //*****************************************************************************************************************************************************
-// Инициализация всех весов, биасов, Adam-массивов и других переменных (полный адаптированный блок без сокращений)
-if barstate.isfirst
-  
-    // Инициализация для LSTM (расширение на lstm_hidden_size * input_dim с вложенными циклами)
-    for i = 0 to lstm_hidden_size - 1
-        for j = 0 to input_dim - 1
-            int idx = i * input_dim + j
-            array.set(lstm_forget_weights_i, idx, math.random(0.2) - 0.1)
-            array.set(lstm_input_weights_i, idx, math.random(0.2) - 0.1)
-            array.set(lstm_cell_weights_i, idx, math.random(0.2) - 0.1)
-            array.set(lstm_output_weights_i, idx, math.random(0.2) - 0.1)
-        
-        array.set(lstm_forget_weights_h, i, math.random(0.2) - 0.1)
-        array.set(lstm_forget_bias, i, 0.0)
-        
-        array.set(lstm_input_weights_h, i, math.random(0.2) - 0.1)
-        array.set(lstm_input_bias, i, 0.0)
-        
-        array.set(lstm_cell_weights_h, i, math.random(0.2) - 0.1)
-        array.set(lstm_cell_bias, i, 0.0)
-        
-        array.set(lstm_output_weights_h, i, math.random(0.2) - 0.1)
-        array.set(lstm_output_bias, i, 0.0)
-
-    // Инициализация Adam-массивов для LSTM (полная)
-    for i = 0 to lstm_hidden_size * input_dim - 1
-        array.set(m_lstm_forget_weights_i, i, 0.0)
-        array.set(v_lstm_forget_weights_i, i, 0.0)
-        
-        array.set(m_lstm_input_weights_i, i, 0.0)
-        array.set(v_lstm_input_weights_i, i, 0.0)
-        
-        array.set(m_lstm_cell_weights_i, i, 0.0)
-        array.set(v_lstm_cell_weights_i, i, 0.0)
-        
-        array.set(m_lstm_output_weights_i, i, 0.0)
-        array.set(v_lstm_output_weights_i, i, 0.0)
-
-    for i = 0 to lstm_hidden_size - 1
-        array.set(m_lstm_forget_weights_h, i, 0.0)
-        array.set(v_lstm_forget_weights_h, i, 0.0)
-        array.set(m_lstm_forget_bias, i, 0.0)
-        array.set(v_lstm_forget_bias, i, 0.0)
-        
-        array.set(m_lstm_input_weights_h, i, 0.0)
-        array.set(v_lstm_input_weights_h, i, 0.0)
-        array.set(m_lstm_input_bias, i, 0.0)
-        array.set(v_lstm_input_bias, i, 0.0)
-        
-        array.set(m_lstm_cell_weights_h, i, 0.0)
-        array.set(v_lstm_cell_weights_h, i, 0.0)
-        array.set(m_lstm_cell_bias, i, 0.0)
-        array.set(v_lstm_cell_bias, i, 0.0)
-        
-        array.set(m_lstm_output_weights_h, i, 0.0)
-        array.set(v_lstm_output_weights_h, i, 0.0)
-        array.set(m_lstm_output_bias, i, 0.0)
-        array.set(v_lstm_output_bias, i, 0.0)
-        
-        
-//*****************************************************************************************************************************************************
-
 dqn_forward(array<State> state_seq) =>
     int seq_len = array.size(state_seq)
     if seq_len == 0
-        [array.new<float>(), 0.5]  // безопасный дефолт
-
+        [array.new<float>(num_actions, 0.0), 0.5]
+    
+    // Создаем flat_input
     array<float> flat_input = array.new<float>(seq_len * num_features, 0.0)
-    for int i = 0 to seq_len - 1
+    for i = 0 to seq_len - 1
         State s = array.get(state_seq, i)
-        for int j = 0 to num_features - 1
+        for j = 0 to num_features - 1
             float val = 0.0
             if not na(s) and array.size(s.features) > j
                 val := nz(array.get(s.features, j), 0.0)
             array.set(flat_input, i * num_features + j, val)
-
+    
+    // ═══ LSTM FORWARD (ЕСЛИ ИСПОЛЬЗУЕТСЯ) ═══
     array<float> lstm_out = array.new<float>(0)
-
-    float nn_output = 0.5
-    array<float> q_values = array.new<float>(num_actions, 0.0)
-
     if use_lstm
         lstm_out := lstm_forward(flat_input, seq_len, input_dim)
-        if array.size(lstm_out) == 0
-            [q_values, nn_output]  // пустое LSTM = выход по умолчанию
-
-        // далее — только если lstm_out не пустой
-        for i = 0 to math.min(array.size(lstm_out) - 1, input_size_nn4 - 12 - 1)
-            needed_size = 12 + i + 1
-            while array.size(nn_inputs) < needed_size
+        
+        // Если LSTM вернул что-то → копируем в nn_inputs
+        if array.size(lstm_out) > 0
+            for i = 0 to math.min(array.size(lstm_out) - 1, lstm_hidden_size - 1)
+                int input_idx = 12 + i
+                if input_idx < input_size_nn4
+                    // Расширяем nn_inputs если нужно
+                    while array.size(nn_inputs) <= input_idx
+                        array.push(nn_inputs, 0.0)
+                    array.set(nn_inputs, input_idx, nz(array.get(lstm_out, i), 0.0))
+    
+    // ═══ ЕСЛИ LSTM НЕ ИСПОЛЬЗУЕТСЯ ИЛИ ВЕРНУЛ ПУСТО ═══
+    // Заполняем nn_inputs базовыми фичами из flat_input
+    if array.size(lstm_out) == 0
+        for i = 0 to math.min(array.size(flat_input) - 1, input_size_nn4 - 1)
+            while array.size(nn_inputs) <= i
                 array.push(nn_inputs, 0.0)
-            array.set(nn_inputs, 12 + i, nz(array.get(lstm_out, i), 0.0))
-
-        // MLP forward
-        for i = 0 to hidden_neurons1_nn4 - 1
-            float sum = nz(array.get(biases_hidden1, i), 0)
-            for j = 0 to input_size_nn4 - 1
-                sum += nz(array.get(nn_inputs, j), 0) * nz(array.get(weights_input_hidden1, i * input_size_nn4 + j), 0)
-            array.set(hidden1_output, i, leaky_relu(sum))
-
-        // остальные слои без изменений …
-
-        float output_sum = nz(array.get(bias_output, 0), 0)
+            array.set(nn_inputs, i, nz(array.get(flat_input, i), 0.0))
+    
+    // ═══ MLP FORWARD (ВСЕГДА ВЫПОЛНЯЕТСЯ) ═══
+    
+    // Hidden Layer 1
+    for i = 0 to hidden_neurons1_nn4 - 1
+        float sum = nz(array.get(biases_hidden1, i), 0.0)
+        for j = 0 to input_size_nn4 - 1
+            if j < array.size(nn_inputs) and i * input_size_nn4 + j < array.size(weights_input_hidden1)
+                sum += nz(array.get(nn_inputs, j), 0.0) * nz(array.get(weights_input_hidden1, i * input_size_nn4 + j), 0.0)
+        
+        while array.size(hidden1_output) <= i
+            array.push(hidden1_output, 0.0)
+        array.set(hidden1_output, i, leaky_relu(sum))
+    
+    // Hidden Layer 2
+    for i = 0 to hidden_neurons2_nn4 - 1
+        float sum = nz(array.get(biases_hidden2, i), 0.0)
+        for j = 0 to hidden_neurons1_nn4 - 1
+            if j < array.size(hidden1_output) and i * hidden_neurons1_nn4 + j < array.size(weights_hidden1_hidden2)
+                sum += nz(array.get(hidden1_output, j), 0.0) * nz(array.get(weights_hidden1_hidden2, i * hidden_neurons1_nn4 + j), 0.0)
+        
+        while array.size(hidden2_output) <= i
+            array.push(hidden2_output, 0.0)
+        array.set(hidden2_output, i, leaky_relu(sum))
+    
+    // Hidden Layer 3
+    for i = 0 to hidden_neurons3_nn4 - 1
+        float sum = nz(array.get(biases_hidden3, i), 0.0)
+        for j = 0 to hidden_neurons2_nn4 - 1
+            if j < array.size(hidden2_output) and i * hidden_neurons2_nn4 + j < array.size(weights_hidden2_hidden3)
+                sum += nz(array.get(hidden2_output, j), 0.0) * nz(array.get(weights_hidden2_hidden3, i * hidden_neurons2_nn4 + j), 0.0)
+        
+        while array.size(hidden3_output) <= i
+            array.push(hidden3_output, 0.0)
+        array.set(hidden3_output, i, leaky_relu(sum))
+    
+    // Hidden Layer 4
+    for i = 0 to hidden_neurons4_nn4 - 1
+        float sum = nz(array.get(biases_hidden4, i), 0.0)
+        for j = 0 to hidden_neurons3_nn4 - 1
+            if j < array.size(hidden3_output) and i * hidden_neurons3_nn4 + j < array.size(weights_hidden3_hidden4)
+                sum += nz(array.get(hidden3_output, j), 0.0) * nz(array.get(weights_hidden3_hidden4, i * hidden_neurons3_nn4 + j), 0.0)
+        
+        while array.size(hidden4_output) <= i
+            array.push(hidden4_output, 0.0)
+        array.set(hidden4_output, i, leaky_relu(sum))
+    
+    // ═══ Q-VALUES OUTPUT ═══
+    array<float> q_values = array.new<float>(num_actions, 0.0)
+    for a = 0 to num_actions - 1
+        float sum = nz(array.get(biases_q, a), 0.0)
         for i = 0 to hidden_neurons4_nn4 - 1
-            output_sum += nz(array.get(hidden4_output, i), 0.0) * nz(array.get(weights_hidden4_output, i), 0.0)
-        nn_output := my_tanh(output_sum)
-
-        for a = 0 to num_actions - 1
-            float sum = nz(array.get(biases_q, a), 0)
-            for i = 0 to hidden_neurons4_nn4 - 1
+            if i < array.size(hidden4_output) and a * hidden_neurons4_nn4 + i < array.size(weights_hidden4_q)
                 sum += nz(array.get(hidden4_output, i), 0.0) * nz(array.get(weights_hidden4_q, a * hidden_neurons4_nn4 + i), 0.0)
-            array.set(q_values, a, sum)
-
+        array.set(q_values, a, sum)
+    
+    // ═══ NN OUTPUT (для совместимости) ═══
+    float nn_output = 0.5
+    if array.size(hidden4_output) > 0
+        float output_sum = 0.0
+        for i = 0 to hidden_neurons4_nn4 - 1
+            if i < array.size(hidden4_output) and i < array.size(weights_hidden4_output)
+                output_sum += nz(array.get(hidden4_output, i), 0.0) * nz(array.get(weights_hidden4_output, i), 0.0)
+        nn_output := my_tanh(output_sum)
+    
     [q_values, nn_output]
+
 
 //********************************************************************************************************************************************************
 
@@ -932,71 +1138,71 @@ fast_vol_boost = atr10 != 0 ? math.pow(atr3 / atr10, 0.3) : 1.0
 dynamic_factor := dynamic_factor * fast_vol_boost  // Умножаем
 nn_confidence = nn_filter_value  // Или твой расчёт
 
-// ───────── Reinforcement-Learning overlay (Q-Learning) ─────────
-// 1. Инициализация replay-буферов
-//── Actions (8 значений 0.3–1.5)
+// =======================================================================
+// REINFORCEMENT LEARNING (Q-LEARNING) - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// =======================================================================
+
+// ───────── 1. Инициализация переменных ─────────
 var float[] rl_actions = array.from(0.30, 0.40, 0.50, 0.70, 0.90, 1.00, 1.20, 1.50)
-float seg_w = 0.05  // Jitter ±2.5%
+float seg_w = 0.05
+
+// Replay buffers
 var array<StateHistory> replay_state = array.new<StateHistory>(replay_size) 
 var array<int> replay_action = array.new<int>(replay_size)
 var array<float> replay_reward = array.new<float>(replay_size)
 var array<StateHistory> replay_next_state = array.new<StateHistory>(replay_size)
-// PER: Новый массив для приоритетов
-var array<float> replay_priority = array.new_float(replay_size, 1.0)  // Начальные приоритеты = 1.0
-// PER: Настройки
-var float priority_alpha = 0.6  // 0=uniform, 1=full PER
-var float priority_eps = 1e-5   // Маленькая добавка для избежания нулевых приоритетов
-var StateHistory prev_history = na  // Новая переменная для хранения истории предыдущего бара
-// Инициализация на первом баре
+var array<float> replay_priority = array.new_float(replay_size, 1.0)
+
+// PER настройки
+var float priority_alpha = 0.6
+var float priority_eps = 1e-5
+
+// История состояний
+var StateHistory prev_history = na
+var array<State> state_history = array.new<State>(history_len)
+
+// ───────── 2. Инициализация на первом баре ─────────
 if barstate.isfirst
-    // 1. Создаем "пустое" состояние (State)
-    State init_st = State.new()
-    init_st.features := array.new<float>(num_features, na)
+    // Инициализация цены входа
+    rl_eq0 := close
     
-    // 2. Создаем "пустую" историю (StateHistory) полной длины
+    // Пустое состояние
+    State init_st = State.new()
+    init_st.features := array.new<float>(num_features, 0.0)
+    
+    // Пустая история
     StateHistory init_hist = StateHistory.new()
     init_hist.history := array.new<State>(history_len)
     for j = 0 to history_len - 1
-        // Заполняем историю placeholder-состояниями
-        array.set(init_hist.history, j, init_st) 
+        array.set(init_hist.history, j, init_st)
     
-    // 3. Заполняем буферы Replay Buffer
+    // Заполнение replay buffer
     for i = 0 to replay_size - 1
-        // replay_state (array<StateHistory>)
-        array.set(replay_state, i, init_hist) 
-        // replay_action (array<int>)
-        array.set(replay_action, i, na)
-        // replay_reward (array<float>)
-        array.set(replay_reward, i, na)
-        // replay_next_state (array<StateHistory>)
+        array.set(replay_state, i, init_hist)
+        array.set(replay_action, i, 0)
+        array.set(replay_reward, i, 0.0)
         array.set(replay_next_state, i, init_hist)
-        // PER: Начальные приоритеты
         array.set(replay_priority, i, 1.0)
-
-// 2. Кольцевая история состояний
-var array<State> state_history = array.new<State>(history_len)
-if barstate.isfirst
-    State init_st = State.new()
-    init_st.features := array.new<float>(num_features, na)
+    
+    // Заполнение state_history
     for i = 0 to history_len - 1
         array.set(state_history, i, init_st)
 
-// 3. Формирование признаков текущего бара
-atr_fast = ta.atr(3)
-atr_slow = ta.atr(14)
-atr_ratio = nz(atr_slow != 0 ? atr_fast / atr_slow : 1.0, 1.0)
-//vol_roc5 = nz(ta.roc(volume, 5), 0.0)
-nn_conf_vel = nz(nn_confidence - nn_confidence[3], 0.0)
+// ───────── 3. Формирование признаков текущего бара ─────────
+float atr_fast = ta.atr(3)
+float atr_slow = ta.atr(14)
+float atr_ratio = nz(atr_slow != 0 ? atr_fast / atr_slow : 1.0, 1.0)
+float nn_conf_vel = nz(nn_confidence - nn_confidence[3], 0.0)
 
 array<float> cur_features = array.from(nz(volatility_index, 1.0), input1, nz(nn_confidence, 0.5), atr_ratio,nz(heidelberg_vol, 0.0))
 
-// 4. Обновление state_history
+// ───────── 4. Обновление state_history ─────────
 State cur_state = State.new()
 cur_state.features := cur_features
 array.shift(state_history)
 array.push(state_history, cur_state)
 
-// 5. Учёт посещённых состояний
+// ───────── 5. Учёт посещённых состояний ─────────
 int rl_state = 0
 for i = 0 to history_len - 1
     array<float> f = array.get(state_history, i).features
@@ -1008,18 +1214,21 @@ if not array.get(visited_states, rl_state)
     array.set(visited_states, rl_state, true)
     visited_count += 1
 
-// 6. Статус готовности
+// ───────── 6. Статус готовности ─────────
 float fill_pct = (visited_count / array.size(visited_states)) * 100
 bool is_ready = fill_pct > 60
-if barstate.islast and rl_bar % 100 == 0
-    label.new(bar_index, high, str.tostring(fill_pct, "%.1f") + "% visited", color=color.blue, style=label.style_label_down)
-if is_ready and barstate.islast
-    label.new(bar_index, low, "Agent ready (>60%)", color=color.green, style=label.style_label_up)
 
-// 7. ε-greedy выбор действия
+if barstate.islast and rl_bar % 100 == 0
+    label.new(bar_index, high, str.tostring(fill_pct, "%.1f") + "% visited", 
+              color=color.blue, style=label.style_label_down)
+
+if is_ready and barstate.islast
+    label.new(bar_index, low, "Agent ready (>60%)", 
+              color=color.green, style=label.style_label_up)
+
+// ───────── 7. ε-greedy выбор действия ─────────
 epsilon := math.max(0.02, epsilon * 0.999)
 int rl_act = 0
-
 var array<float> q_vals = na
 var float nn_out = na
 
@@ -1030,31 +1239,51 @@ else
     [q_vals, nn_out] = dqn_forward(state_history)
     rl_act := array_argmax(q_vals)
 
-// 8. NN-фильтр
+// ───────── 8. NN-фильтр ─────────
 nn_filter_value := 1.0 + nn_out * 0.5
 
-// 9. Генерация коэффициента
-float base_val = rl_act <= 2 ? 0.30 + rl_act * 0.10 + math.random() * 0.10 : rl_act <= 4 ? 0.70 + (rl_act - 3) * 0.10 + math.random() * 0.10 : rl_act <= 5 ? 1.00 + math.random() * 0.10 : rl_act == 6 ? 1.20 + math.random() * 0.10 : 1.40 + math.random() * 0.10
+// ───────── 9. Генерация коэффициента ─────────
+float base_val = rl_act <= 2 ? 0.30 + rl_act * 0.10 + math.random() * 0.10 : 
+                 rl_act <= 4 ? 0.70 + (rl_act - 3) * 0.10 + math.random() * 0.10 : 
+                 rl_act <= 5 ? 1.00 + math.random() * 0.10 : 
+                 rl_act == 6 ? 1.20 + math.random() * 0.10 : 
+                               1.40 + math.random() * 0.10
+
 float jitter = (math.random() - 0.5) * 2 * seg_w
 float rl_factor = math.max(0.30, math.min(base_val + jitter, 1.50))
 dynamic_factor := dynamic_factor * rl_factor
 
-// 10. Итоговый множитель
-
-float default_factor = base_fact // Значение по умолчанию для вашего скрипта
-float base_cs = nz(best_basefact, default_factor) // Защита: используем best_basefact, если он не NA, иначе base_fact
-// Если CS ВЫКЛЮЧЕН, используем дефолтное значение (base_fact).
-// Если CS ВКЛЮЧЕН, используем оптимизированный best_basefact.
+// ───────── 10. Итоговый множитель ─────────
+float default_factor = base_fact
+float base_cs = nz(best_basefact, default_factor)
 float base_factor_to_use = default_factor
 raw_factor = dynamic_factor * nn_filter_value * (use_base_factor ? base_factor_to_use : 1.0) 
 final_factor = math.max(0.1, math.min(raw_factor, 3.0))
 
-// 11. Сохраняем переход в replay-буфер
+// ───────── 11. Сохраняем переход в replay-буфер ─────────
 rl_bar += 1
-if not na(prev_history) and not na(rl_prevA)
-    float reward = na(rl_eq0) ? 0 : (close - rl_eq0) / episode_len
 
-    // S: предыдущая история (с прошлого бара)
+if not na(prev_history) and not na(rl_prevA)
+    // 🆕 ИСПРАВЛЕННЫЙ REWARD
+    // Инициализация rl_eq0 если не установлен
+    if na(rl_eq0)
+        rl_eq0 := close
+    
+    // Вычисляем reward в процентах
+    float reward_raw = (close - rl_eq0) / math.max(rl_eq0, 1e-10)
+    
+    // 🔥 МАСШТАБИРУЕМ REWARD (увеличиваем в 1000 раз!)
+    float reward = reward_raw * 1000.0
+    
+    // 🆕 REWARD SHAPING (бонусы за правильные действия)
+    if reward_raw > 0.0001  // Цена выросла
+        if rl_prevA >= 4  // Long действия (4-7)
+            reward += 0.5  // Бонус за правильное направление
+    else if reward_raw < -0.0001  // Цена упала
+        if rl_prevA < 4  // Short действия (0-3)
+            reward += 0.5  // Бонус за правильное направление
+    
+    // Сохранение в replay buffer
     array.set(replay_state, replay_pointer, prev_history)
     array.set(replay_action, replay_pointer, rl_prevA)
     array.set(replay_reward, replay_pointer, reward)
@@ -1063,28 +1292,28 @@ if not na(prev_history) and not na(rl_prevA)
     StateHistory next_hist = StateHistory.new()
     next_hist.history := array.copy(state_history)
     array.set(replay_next_state, replay_pointer, next_hist)
-
-    // PER: Инициализация приоритета (на основе максимального текущего)
+    
+    // PER: инициализация приоритета
     float max_pr = array.max(replay_priority)
     array.set(replay_priority, replay_pointer, nz(max_pr, 1.0) + priority_eps)
-
+    
     replay_pointer := (replay_pointer + 1) % replay_size
     replay_fill := math.min(replay_fill + 1, replay_size)
+    
+    // 🆕 Обновляем rl_eq0 для следующего перехода
+    rl_eq0 := close
 
-// 12. Сохраняем историю для следующего бара
+// ───────── 12. Сохраняем историю для следующего бара ─────────
 prev_history := StateHistory.new()
 prev_history.history := array.copy(state_history)
 rl_prevA := rl_act
+
 //******************************************************************************************************************************************************
 [st, dir_val] = pine_supertrend(final_factor, final_centroid)
-
 
 bool crossUp = close > st and close[1] <= st[1]
 bool crossDown = close < st and close[1] >= st[1]
 
-// ========================================
-// ОБЫЧНЫЕ СИГНАЛЫ
-// ========================================
 bool buy_signal = crossUp and barstate.isconfirmed and not na(final_centroid)
 bool sell_signal = crossDown and barstate.isconfirmed and not na(final_centroid)
 
@@ -1124,106 +1353,67 @@ if barstate.isrealtime
                 array.push(feats, vwap_diff[offset])
                 array.push(feats, hurst_proxy[offset])
                 array.push(feats, ichi_cloud_diff[offset])
-                //array.push(feats, ichi_conversion_base_diff[offset])
                 array.push(feats, heidelberg_vol[offset])
-                //array.push(feats, ichi_price_cloud_position_norm[offset])
-                //array.push(feats, ichi_chikou_confirmation_norm[offset])
-                //array.push(feats, ichi_htf_diff_norm[offset])
-                //array.push(feats, ichi_vol_adjusted_norm[offset])
-
+        
                 State st = f_create_state(feats)
                 array.push(state_seq, st)
 
                 offset := offset - 1
                 
-// 12. Backpropagation с правильной декларацией target
-var float prev_error = 0.0
-var int lr_update_count = 0  // Можно удалить, если не нужен
-float output_delta = na  // градиент для выходного нейрона
-var float clip_threshold = 1.0
+// =======================================================================
+// ПЕРЕМЕННЫЕ (В НАЧАЛО СКРИПТА)
+// =======================================================================
 
-// --- Новые inputs для adaptive LR (вставь в начало скрипта, если нет) ---
-smooth_len  = input.int(20,  "EMA Length for Error",   group = "ML Settings")
+smooth_len  = input.int(20,  "EMA Length for Error", group = "ML Settings")
 decay_up    = input.float(1.05, "LR Multiplier Up (error ↓)", group = "ML Settings")
-decay_down  = input.float(0.95, "LR Multiplier Down (error ↑)",  group = "ML Settings")
+decay_down  = input.float(0.95, "LR Multiplier Down (error ↑)", group = "ML Settings")
 min_lr      = input.float(0.0001, "Min LR", group = "ML Settings")
 max_lr      = input.float(0.05,   "Max LR", group = "ML Settings")
+// Batch size
+batch_size = input.int(8, "Batch Size", group="SuperTrend", minval=1)
+// Переменные для adaptive LR
+var float smooth_error_lr = na
+var float last_error_lr = na
+var float adaptive_lr = learning_rate
+// Переменные для обучения
+var float prev_error = 0.0
+var float clip_threshold = 1.0
+var float alpha_ema = 0.1
+var float smooth_error = 0.0
+// PER параметры
+var float priority_beta = 0.4
+var float beta_increment = 0.0005
+// =======================================================================
+// FORWARD PASS (ВСЕГДА ВЫПОЛНЯЕТСЯ)
+// =======================================================================
 
-// --- Persistent state для adaptive LR (добавь эти var) ---
-var float smooth_error = na
-var float last_error   = na
-var float adaptive_lr  = learning_rate  // Стартуем с твоего текущего LR
-
-if use_nn_filter and auto_optimize and bar_index >= training_period and barstate.isrealtime
-    var float target = na
-    bool is_correct_signal = (buy_signal or sell_signal or buy_signal[1] or sell_signal[1]) and ((buy_signal and close > open) or (sell_signal and close < open))
-    if buy_signal or sell_signal
-        target := is_correct_signal ? 1.0 : -1.0
-
-    if not na(target)
-        adam_timestep += 1
-        
-        // 1. Ошибка
-        current_error = math.abs(target - nz(nn_output_val_prev, 0.5))
-        
-        // 2. EMA ошибки
-        smooth_error := na(smooth_error) ? current_error : ta.ema(current_error, smooth_len)
-        
-        // 3. Обновляем learning rate
-        if not na(last_error)
-            if smooth_error < last_error
-                adaptive_lr := math.min(adaptive_lr * decay_up, max_lr)
-            else
-                adaptive_lr := math.max(adaptive_lr * decay_down, min_lr)
-        
-        // 4. Save LR
-        learning_rate := adaptive_lr
-        last_error := smooth_error
-    if array.size(state_seq) > 0 and not na(close)
-        [q_vals, nn_output_val] = dqn_forward(state_seq)
+if array.size(state_seq) > 0 and not na(close)
+    [q_vals, nn_output_val] = dqn_forward(state_seq)
+    
     if not na(nn_output_val)
-        nn_output_val_prev := nn_output_val     // обновляем только если валидное значение
+        nn_output_val_prev := nn_output_val
     else
-        nn_output_val_prev := nz(nn_output_val_prev, 0.5)  // сохраняем предыдущее или дефолт (0.5)
-//***********************************************************************************************************************************************        
-// ╔════════════════════════════════════════════════════════╗
-// ║ ADAPTIVE HINGE LOSS (ОКОНЧАТЕЛЬНО ИСПРАВЛЕННО V2)    ║
-// ╚════════════════════════════════════════════════════════╝
+        nn_output_val_prev := nz(nn_output_val_prev, 0.5)
 
-    use_adaptive_hinge = input.bool(true, "Use Adaptive Hinge Loss", group="ML Settings")
-    adaptive_scale = input.float(0.5, "Adaptive Margin Scale", minval=0.1, maxval=2.0, group="ML Settings")
-    use_l2_penalty = input.bool(true, "Use L2 Penalty", group="ML Settings")
+// =======================================================================
+// ADAPTIVE LEARNING RATE (НА ОСНОВЕ ОШИБКИ)
+// =======================================================================
 
-// ═══ ВОЛАТИЛЬНОСТЬ ═══
-    float volatility_factor = smooth_error
+// Обновляем smooth_error для gradient clipping
+smooth_error := 0.9 * smooth_error + 0.1 * ema_error
 
-// ═══ ADAPTIVE HINGE LOSS ═══
-    if use_adaptive_hinge
-    // Динамический margin
-        float base_margin = 1.0
-        float volatility_adjustment = adaptive_scale * volatility_factor
-        float adaptive_margin = my_clamp(base_margin + volatility_adjustment, 0.5, 2.0)
+// Adaptive LR на основе EMA ошибки
+if not na(ema_error) and ema_error > 0
+    smooth_error_lr := na(smooth_error_lr) ? ema_error : ta.ema(ema_error, smooth_len)
     
-        float margin = target * nn_output_val_prev
-        float hinge_loss = math.max(0.0, adaptive_margin - margin)
+    if not na(last_error_lr)
+        if smooth_error_lr < last_error_lr
+            adaptive_lr := math.min(adaptive_lr * decay_up, max_lr)
+        else
+            adaptive_lr := math.max(adaptive_lr * decay_down, min_lr)
     
-    // Градиент Hinge Loss (БЕЗ weight, т.к. это не нужно здесь)
-        float grad_hinge = margin < adaptive_margin ? -target : 0.0
-    
-    // L2 штраф добавляется ПРЯМО к логит-выходу
-    // (weight - это параметр output слоя, но он обновляется отдельно)
-        float grad_total = grad_hinge
-    // ← L2 штраф применяется при обновлении весов (в Adam optimizer), не здесь!
-    
-        output_delta := grad_total * (1.0 - nn_output_val_prev * nn_output_val_prev)
-    
-    else
-    // ═══ СТАНДАРТНЫЙ HINGE LOSS ═══
-        float margin = target * nn_output_val_prev
-        float hinge_loss = math.max(0.0, 1.0 - margin)
-        float grad_hinge = margin < 1.0 ? -target : 0.0
-    
-        output_delta := grad_hinge * (1.0 - nn_output_val_prev * nn_output_val_prev)
+    learning_rate := adaptive_lr
+    last_error_lr := smooth_error_lr
 
 // =======================================================================
 // ОСНОВНОЙ БЛОК ДИНАМИЧЕСКОЙ КОРРЕКЦИИ
@@ -1233,7 +1423,7 @@ float atr_change_norm = atr_change_raw / (vol_std + 1e-10)
 int atr_change_ema_length = 3
 float atr_change_ema = ta.ema(atr_change_norm, atr_change_ema_length)
 
-if barstate.isrealtime
+if barstate.isconfirmed or barstate.isrealtime
 
     // Флаг для отслеживания изменения TD-Error
     var bool td_change_made = false
@@ -1354,7 +1544,6 @@ apply_l2_to_accumulated_gradients(array<float> acc_grads, array<float> weights, 
 
 //************************************************************************************************************************************************************
 // Добавьте новые переменные для EMA ошибки (persistent)
-var float alpha_ema = 0.1    // Коэффициент сглаживания (настройте)
 
 // Функция для адаптивного clip_threshold_gate
 adaptive_clip_threshold_gate(float error_ema) =>
@@ -1726,15 +1915,11 @@ backpropagation(array<float> linear_td_errors, array<int> actions) =>
     update_count = nz(update_count) + 1
     
     average_error
-//***********************************************************************************************************************************************************
-// ───────── Обучение DQN с мини-батчами ──────────────────
-rl_bar += 1
-// Добавьте глобальную переменную для размера батча
-//var int batch_size = 8  // Размер мини-батча (рекомендуется 2-8)
-batch_size = input.int(6, "Batch Size", group="SuperTrend", minval=1)
-var float priority_beta = 0.4   // Начинаем с 0.4, растёт до 1.0 (importance sampling bias correction)
-var float beta_increment = 0.0005  // Шаг роста beta на каждом обучении (настройте под общее число шагов)
-// Helper функция: бинарный поиск в отсортированном массиве
+// =======================================================================
+// ОБУЧЕНИЕ Q-LEARNING С PER - ПОЛНЫЙ БЛОК С DEBUG (БЕЗ RUNTIME.LOG)
+// =======================================================================
+
+// ───────── Helper функция: бинарный поиск ─────────
 f_binary_search(array<float> sorted_arr, float target) =>
     int left = 0
     int right = array.size(sorted_arr) - 1
@@ -1752,13 +1937,12 @@ f_binary_search(array<float> sorted_arr, float target) =>
     
     result
 
-// 2. PER функция (ОПТИМИЗИРОВАННАЯ)
-per_sample_optimized(int batch_size, int replay_fill) =>
-    // Вычисляем приоритеты ОД раз
-    array<float> priorities = array.new<float>(replay_fill)
+// ───────── PER функция (ОПТИМИЗИРОВАННАЯ) ─────────
+per_sample_optimized(int batch_size_param, int replay_fill_param) =>
+    array<float> priorities = array.new<float>(replay_fill_param)
     float sum_pr = 0.0
     
-    for i = 0 to replay_fill - 1
+    for i = 0 to replay_fill_param - 1
         float pr = math.pow(array.get(replay_priority, i), priority_alpha)
         array.set(priorities, i, pr)
         sum_pr += pr
@@ -1766,51 +1950,64 @@ per_sample_optimized(int batch_size, int replay_fill) =>
     if sum_pr <= 0
         sum_pr := 1e-8
     
-    // Cum-sum
-    array<float> cum_priority = array.new<float>(replay_fill)
+    array<float> cum_priority = array.new<float>(replay_fill_param)
     float cum_sum = 0.0
-    for i = 0 to replay_fill - 1
+    for i = 0 to replay_fill_param - 1
         cum_sum += array.get(priorities, i)
         array.set(cum_priority, i, cum_sum)
     
-    // Батч с бинарным поиском
-    int[] batch_indices = array.new_int(batch_size)
-    float[] is_weights = array.new_float(batch_size)
+    array<int> batch_indices = array.new_int(batch_size_param)
+    array<float> is_weights = array.new_float(batch_size_param)
     float max_weight = 0.0
     
-    for b = 0 to batch_size - 1
+    for b = 0 to batch_size_param - 1
         float r = math.random() * sum_pr
         int idx = f_binary_search(cum_priority, r)
         
         array.set(batch_indices, b, idx)
         
         float prob = array.get(priorities, idx) / sum_pr
-        float weight = math.pow(replay_fill * math.max(prob, 1e-10), -priority_beta)
+        float weight = math.pow(replay_fill_param * math.max(prob, 1e-10), -priority_beta)
         
         array.set(is_weights, b, weight)
-        max_weight = math.max(max_weight, weight)
+        max_weight := math.max(max_weight, weight)
     
-    // Нормализация
     if max_weight > 0
-        for b = 0 to batch_size - 1
+        for b = 0 to batch_size_param - 1
             array.set(is_weights, b, array.get(is_weights, b) / max_weight)
     
     [batch_indices, is_weights]
 
-// 3. Параметры
+// ───────── ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ DEBUG ─────────
+var float debug_avg_reward = 0.0
+var float debug_avg_max_q = 0.0
+var float debug_avg_target_q = 0.0
+var float debug_avg_old_q = 0.0
+var float debug_min_td = 0.0
+var float debug_max_td = 0.0
+var int debug_zero_td_count = 0
+var bool debug_all_q_zero = false
+var bool debug_all_reward_zero = false
 
-// 4. ОБУЧЕНИЕ
-rl_bar += 1
-
+// ───────── ОСНОВНОЙ БЛОК ОБУЧЕНИЯ С DEBUG ─────────
 if rl_bar % train_freq == 0 and replay_fill >= batch_size
-    // Выборка батча с PER
     [batch_indices, is_weights] = per_sample_optimized(batch_size, replay_fill)
     
-    float[] batch_linear_td_errors = array.new_float(batch_size, 0.0)
-    float[] pure_td_errors = array.new_float(batch_size, 0.0)
-    int[] batch_actions = array.new_int(batch_size, 0)
+    array<float> batch_linear_td_errors = array.new_float(batch_size, 0.0)
+    array<float> pure_td_errors = array.new_float(batch_size, 0.0)
+    array<int> batch_actions = array.new_int(batch_size, 0)
     
-    // Обработка батча
+    float sum_abs_td_error_batch = 0.0
+    
+    // 🆕 DEBUG ПЕРЕМЕННЫЕ (локальные)
+    float debug_sum_target_q = 0.0
+    float debug_sum_old_q = 0.0
+    float debug_sum_reward = 0.0
+    float debug_sum_max_q = 0.0
+    float debug_min_td_local = 999999.0
+    float debug_max_td_local = -999999.0
+    int debug_zero_td_count_local = 0
+    
     for b = 0 to batch_size - 1
         int sample_idx = array.get(batch_indices, b)
         
@@ -1819,40 +2016,163 @@ if rl_bar % train_freq == 0 and replay_fill >= batch_size
         float sample_reward = array.get(replay_reward, sample_idx)
         StateHistory sample_next_hist = array.get(replay_next_state, sample_idx)
         
-        // Forward pass на next state
         [q_next, _] = dqn_forward(sample_next_hist.history)
         float max_q = array.max(q_next)
         
-        // Target Q-value
         float target_q = sample_reward + rl_gamma * max_q
         
-        // Forward pass на current state
         [q_pred, _] = dqn_forward(sample_state_hist.history)
         float old_q = array.get(q_pred, sample_act)
         
-        // TD-ошибка
         float pure_td_error = target_q - old_q
+        
         float loss = math.pow(pure_td_error, 2)
         float linear_td_error = math.sqrt(math.abs(loss)) * math.sign(pure_td_error)
-        
-        // Масштабируем IS-весом для backprop
         float scaled_td_error = linear_td_error * array.get(is_weights, b)
         
         array.set(batch_linear_td_errors, b, scaled_td_error)
         array.set(pure_td_errors, b, pure_td_error)
         array.set(batch_actions, b, sample_act)
+        
+        float abs_td = math.abs(pure_td_error)
+        sum_abs_td_error_batch += abs_td
+        
+        // 🆕 DEBUG: накапливаем статистику
+        debug_sum_target_q += target_q
+        debug_sum_old_q += old_q
+        debug_sum_reward += sample_reward
+        debug_sum_max_q += max_q
+        debug_min_td_local := math.min(debug_min_td_local, abs_td)
+        debug_max_td_local := math.max(debug_max_td_local, abs_td)
+        
+        if abs_td < 0.0001
+            debug_zero_td_count_local += 1
     
-    // Backpropagation с IS-весами
-    backpropagation(batch_linear_td_errors, batch_actions)
+    float avg_td_error = sum_abs_td_error_batch / batch_size
     
-    // Обновление приоритетов на основе чистой ошибки
+    sum_abs_td_error_total += sum_abs_td_error_batch
+    td_error_count += batch_size
+    
+    // 🆕 Сохраняем в глобальные переменные для отображения
+    debug_avg_reward := debug_sum_reward / batch_size
+    debug_avg_max_q := debug_sum_max_q / batch_size
+    debug_avg_target_q := debug_sum_target_q / batch_size
+    debug_avg_old_q := debug_sum_old_q / batch_size
+    debug_min_td := debug_min_td_local
+    debug_max_td := debug_max_td_local
+    debug_zero_td_count := debug_zero_td_count_local
+    debug_all_q_zero := (debug_sum_old_q == 0.0 and debug_sum_max_q == 0.0)
+    debug_all_reward_zero := (debug_sum_reward == 0.0)
+    
+    float training_error = backpropagation(batch_linear_td_errors, batch_actions)
+    
+    td_error := avg_td_error
+    ema_error := alpha_ema * td_error + (1 - alpha_ema) * ema_error
+    update_count += 1
+    adam_timestep += 1
+    
     for b = 0 to batch_size - 1
         int idx = array.get(batch_indices, b)
         float new_priority = math.abs(array.get(pure_td_errors, b)) + priority_eps
         array.set(replay_priority, idx, new_priority)
     
-    // Annealing beta (0.4 → 1.0)
     priority_beta := math.min(1.0, priority_beta + beta_increment)
+// =======================================================================
+// ИНФОРМАЦИОННАЯ DEBUG ПАНЕЛЬ (С ФЛАГОМ ПОКАЗАТЬ/СКРЫТЬ)
+// =======================================================================
+
+// Блок debug панели
+if barstate.islast and show_debug  // ✅ Добавлено условие show_debug
+    var table debug_table = table.new(position.top_left, 2, 18, 
+         bgcolor=color.new(color.black, 10), 
+         border_width=2, 
+         border_color=color.orange)
+    
+    // Очистка таблицы (на случай если она существует)
+    table.clear(debug_table, 0, 0, 1, 17)
+    
+    // Заголовок
+    table.cell(debug_table, 0, 0, "DEBUG METRIC", text_color=color.white, bgcolor=color.new(color.orange, 0))
+    table.cell(debug_table, 1, 0, "VALUE", text_color=color.white, bgcolor=color.new(color.orange, 0))
+    
+    // Основные метрики
+    table.cell(debug_table, 0, 1, "Update Count", text_color=color.white)
+    table.cell(debug_table, 1, 1, str.tostring(update_count), text_color=color.white)
+    
+    table.cell(debug_table, 0, 2, "RL Bar", text_color=color.white)
+    table.cell(debug_table, 1, 2, str.tostring(rl_bar), text_color=color.white)
+    
+    table.cell(debug_table, 0, 3, "Replay Fill", text_color=color.white)
+    float fill_pct = replay_fill / replay_size * 100
+    table.cell(debug_table, 1, 3, str.tostring(replay_fill) + "/" + str.tostring(replay_size) + 
+               " (" + str.tostring(fill_pct, "#.#") + "%)", text_color=color.white)
+    
+    // --- SEPARATOR ---
+    table.cell(debug_table, 0, 4, "--- Q-VALUES ---", text_color=color.yellow, bgcolor=color.new(color.gray, 80))
+    table.cell(debug_table, 1, 4, "", bgcolor=color.new(color.gray, 80))
+    
+    // Q-Values Debug
+    table.cell(debug_table, 0, 5, "Avg Reward", text_color=color.white)
+    table.cell(debug_table, 1, 5, str.tostring(debug_avg_reward, "#.######"), 
+         text_color=debug_avg_reward == 0.0 ? color.orange : color.green)
+    
+    table.cell(debug_table, 0, 6, "Avg Max Q (next)", text_color=color.white)
+    table.cell(debug_table, 1, 6, str.tostring(debug_avg_max_q, "#.######"), 
+         text_color=debug_avg_max_q == 0.0 ? color.red : color.green)
+    
+    table.cell(debug_table, 0, 7, "Avg Target Q", text_color=color.white)
+    table.cell(debug_table, 1, 7, str.tostring(debug_avg_target_q, "#.######"), 
+         text_color=debug_avg_target_q == 0.0 ? color.red : color.green)
+    
+    table.cell(debug_table, 0, 8, "Avg Old Q", text_color=color.white)
+    table.cell(debug_table, 1, 8, str.tostring(debug_avg_old_q, "#.######"), 
+         text_color=color.white)
+    
+    // --- SEPARATOR ---
+    table.cell(debug_table, 0, 9, "--- TD-ERROR ---", text_color=color.yellow, bgcolor=color.new(color.gray, 80))
+    table.cell(debug_table, 1, 9, "", bgcolor=color.new(color.gray, 80))
+    
+    // TD-Error Debug
+    table.cell(debug_table, 0, 10, "Avg TD-Error", text_color=color.white)
+    table.cell(debug_table, 1, 10, str.tostring(td_error, "#.######"), 
+         text_color=td_error == 0.0 ? color.red : color.green)
+    
+    table.cell(debug_table, 0, 11, "Min TD-Error", text_color=color.white)
+    table.cell(debug_table, 1, 11, str.tostring(debug_min_td, "#.######"), text_color=color.white)
+    
+    table.cell(debug_table, 0, 12, "Max TD-Error", text_color=color.white)
+    table.cell(debug_table, 1, 12, str.tostring(debug_max_td, "#.######"), text_color=color.white)
+    
+    table.cell(debug_table, 0, 13, "Zero TD Count", text_color=color.white)
+    table.cell(debug_table, 1, 13, str.tostring(debug_zero_td_count) + "/" + str.tostring(batch_size), 
+         text_color=debug_zero_td_count == batch_size ? color.red : color.green)
+    
+    table.cell(debug_table, 0, 14, "EMA Error", text_color=color.white)
+    table.cell(debug_table, 1, 14, str.tostring(ema_error, "#.######"), 
+         text_color=ema_error == 0.0 ? color.red : color.green)
+    
+    // --- SEPARATOR ---
+    table.cell(debug_table, 0, 15, "--- WARNINGS ---", text_color=color.yellow, bgcolor=color.new(color.gray, 80))
+    table.cell(debug_table, 1, 15, "", bgcolor=color.new(color.gray, 80))
+    
+    // Warnings
+    string warning1 = debug_all_q_zero ? "⚠️ Q-VALUES = 0!" : "✅ Q-values OK"
+    table.cell(debug_table, 0, 16, warning1, 
+         text_color=debug_all_q_zero ? color.red : color.green)
+    table.cell(debug_table, 1, 16, "", text_color=color.white)
+    
+    string warning2 = debug_all_reward_zero ? "⚠️ REWARDS = 0!" : "✅ Rewards OK"
+    table.cell(debug_table, 0, 17, warning2, 
+         text_color=debug_all_reward_zero ? color.red : color.green)
+    table.cell(debug_table, 1, 17, "", text_color=color.white)
+
+// 🆕 АЛЬТЕРНАТИВНЫЙ СПОСОБ: Удаление таблицы если флаг выключен
+if barstate.islast and not show_debug
+    // Удаляем таблицу если она существует
+    var table debug_table = na
+    if not na(debug_table)
+        table.delete(debug_table)
+        debug_table := na
 
 //*******************************************************************************************************************************************************
 // 13. Визуализация
@@ -1877,8 +2197,9 @@ else if sell_signal
 
 plotshape(buy_signal, text="Long", textcolor=color.white, style=shape.labelup, location=location.belowbar, color=color_bull, size=size.tiny)
 plotshape(sell_signal, text="Short", textcolor=color.white, style=shape.labeldown, location=location.abovebar, color=color_bear, size=size.tiny)
-
 bgcolor(dir_val == -1 ? color.new(color.green, 90) : dir_val == 1 ? color.new(color.red, 90) : na)
+
+
 // =================== ДИАГНОСТИКА С L2 МОНИТОРИНГОМ ===================
               
 // 16. Информационная панель
@@ -1918,8 +2239,12 @@ if bar_index % resample_freq == 0 or barstate.islast
      + "\nSIGNAL BAR: " + signal_bar_text
      + "\nTRAIN BARS: " + str.tostring(math.min(training_period, max_training_bars))
      + "\nLEARNING RATE: " + str.tostring(adaptive_lr, "#.#####")
-     + "\nFill Percent: " + str.tostring(fill_pct, "#.##")
+     + "\nFill Percent: " + str.tostring(replay_fill) + "/" + str.tostring(replay_size)
      + "\nAdaptiv lstm_timesteps: " + str.tostring(lstm_timesteps, "#.##")
+     + "\nTD_Error: " + str.tostring(td_error, "#.######")
+     + "\nEpsilon: " + str.tostring(epsilon, "#.######")
+     + "\nEma_Error: " + str.tostring(ema_error, "#.######")
+     + "\nUpdate_count: " + str.tostring(update_count)
      + "\nCOMPLEXITY: O(n)"
     if debug_mode
         debug_info := "\n\n--- DEBUG ---" +
