@@ -52,14 +52,14 @@ This is a learning tool, not a production trading system. Always backtest thorou
 The "brain" that makes trading decisions.
 
 - **8 possible actions** (ATR multipliers: 0.3 → 1.5)
-- **4-layer MLP** (Multi-Layer Perceptron): 128 → 64 → 32 → 16 neurons
+- **4-layer MLP** (Multi-Layer Perceptron): 24 → 16 → 8 → 4 neurons
 - **Q-values** predict expected reward for each action
 - **Epsilon-greedy** exploration (10% → 2% decay)
 
 ### 🔮 LSTM Neural Network
 Understands temporal patterns and market context.
 
-- **64 hidden units** (configurable)
+- **24 hidden units** (configurable)
 - **Dynamic timesteps** (8-20 bars, adapts to volatility)
 - **4 gates**: Forget, Input, Cell, Output
 - **Backpropagation Through Time (BPTT)**
@@ -100,7 +100,7 @@ Market Data
     ↓
 [LSTM Layer] → Temporal patterns (8-20 timesteps)
     ↓
-[MLP Network] → 128→64→32→16 neurons
+[MLP Network] → 24→16→8→4 neurons
     ↓
 [Q-Values] → 8 actions (ATR multipliers)
     ↓
