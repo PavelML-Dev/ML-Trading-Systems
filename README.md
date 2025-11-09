@@ -353,8 +353,7 @@ This project implements techniques from cutting-edge research:
 
 - **GitHub Issues**: [Report bugs or request features](https://github.com/YOUR_USERNAME/ml-supertrend-ultimate/issues)
 - **GitHub Discussions**: [Ask questions, share ideas](https://github.com/YOUR_USERNAME/ml-supertrend-ultimate/discussions)
-- **TradingView**: [@YOUR_TV_USERNAME](https://www.tradingview.com/u/YOUR_TV_USERNAME/)
-- **Email**: your.email@example.com
+- **Email**: sail-com@mail.ru
 
 ---
 
