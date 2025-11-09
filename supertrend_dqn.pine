@@ -1370,7 +1370,7 @@ decay_down  = input.float(0.95, "LR Multiplier Down (error ↑)", group = "ML Se
 min_lr      = input.float(0.0001, "Min LR", group = "ML Settings")
 max_lr      = input.float(0.05,   "Max LR", group = "ML Settings")
 // Batch size
-batch_size = input.int(8, "Batch Size", group="SuperTrend", minval=1)
+batch_size = input.int(6, "Batch Size", group="SuperTrend", minval=1)
 // Переменные для adaptive LR
 var float smooth_error_lr = na
 var float last_error_lr = na
@@ -2280,4 +2280,5 @@ if bar_index < min_bars and bar_index % 10 == 0
               style=label.style_label_down,
               color=color.new(color.orange, 0),
               textcolor=color.white)
+
 
