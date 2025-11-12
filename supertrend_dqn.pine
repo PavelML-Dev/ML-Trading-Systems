@@ -2453,7 +2453,7 @@ if bar_index % resample_freq == 0 or barstate.islast
      + "\nEpsilon: " + str.tostring(epsilon, "#.######")
      + "\nEma_Error: " + str.tostring(ema_error, "#.######")
      + "\nUpdate_count: " + str.tostring(update_count)
-     + "\nGradiens"
+     + "\nGradients"
      + "\nTotal Norm: " + str.tostring(debug_grad_norm, "#.########")
      + "\nMLP Norm: " + str.tostring(debug_mlp_grad_norm, "#.########")
      + "\nClipping: " + str.tostring(debug_clipping_count, "#.########")
@@ -2493,5 +2493,6 @@ if bar_index < min_bars and bar_index % 10 == 0
               style=label.style_label_down,
               color=color.new(color.orange, 0),
               textcolor=color.white)
+
 
 
