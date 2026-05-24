@@ -125,7 +125,7 @@ use_cnn_filter = input.bool(true, "Use CNN-like Filter", group="Neural Network")
 cnn_window_size = input.int(10, "CNN Window Size", minval=5, maxval=50, group="Neural Network")
 cnn_filter_size = input.int(3, "CNN Filter Size", minval=2, maxval=10, group="Neural Network")
 
-int num_features     = 4      // сколько признаков в каждом State
+int num_features     = 5      // сколько признаков в каждом State
 int num_actions      = 8      // количество Q-действий
 var int input_size_nn4 = 20
 var int hidden_neurons1_nn4 = 24
@@ -236,12 +236,20 @@ var float[] lstm_hidden_state = array.new_float(lstm_hidden_size, 0.0)
 var float[] input_history = array.new_float(lstm_timesteps, 0.0)
 
 // 🆕 Хранение состояний для BPTT (плоские массивы для каждого timestep)
-var float[] lstm_hidden_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var float[] lstm_cell_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var float[] lstm_forget_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var float[] lstm_input_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var float[] lstm_candidate_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var float[] lstm_output_history = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
+history_len = input.int(18, "State History Length (bars)", minval=8, maxval=20, group="DQN")
+int max_seq_len = math.max(lstm_timesteps, history_len) 
+
+var float[] lstm_hidden_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var float[] lstm_cell_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var float[] lstm_forget_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var float[] lstm_input_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var float[] lstm_candidate_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var float[] lstm_output_history = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+
+// Дельты для LSTM (как в твоём коде)
+var array<float> delta_hidden = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+var array<float> delta_cell = array.new_float(max_seq_len * lstm_hidden_size, 0.0)
+
 // Аккумуляторы для градиентов MLP (весов и bias)
 var array<float> acc_weights_h4_q = array.new_float(num_actions * hidden_neurons4_nn4, 0.0)
 var array<float> acc_biases_q = array.new_float(num_actions, 0.0)
@@ -274,9 +282,29 @@ var array<float> acc_hidden3_deltas = array.new_float(hidden_neurons3_nn4, 0.0)
 var array<float> acc_hidden2_deltas = array.new_float(hidden_neurons2_nn4, 0.0)
 var array<float> acc_hidden1_deltas = array.new_float(hidden_neurons1_nn4, 0.0)
 
-// Дельты для LSTM (как в твоём коде)
-var array<float> delta_hidden = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
-var array<float> delta_cell = array.new_float(lstm_timesteps * lstm_hidden_size, 0.0)
+
+
+// =======================================================================
+// DEBUG ПЕРЕМЕННЫЕ (ОБЪЯВЛЕНИЕ - ДОЛЖНО БЫТЬ В НАЧАЛЕ)
+// =======================================================================
+var float debug_avg_reward = 0.0
+var float debug_avg_max_q = 0.0
+var float debug_avg_target_q = 0.0
+var float debug_avg_old_q = 0.0
+var float debug_min_td = 0.0
+var float debug_max_td = 0.0
+var int debug_zero_td_count = 0
+var bool debug_all_q_zero = false
+var bool debug_all_reward_zero = false
+var float debug_grad_norm = 0.0
+var int debug_clipping_count = 0
+var float debug_max_grad = 0.0
+var float debug_mlp_grad_norm = 0.0
+var float debug_lstm_grad_norm = 0.0
+var float debug_l2_loss = 0.0
+var float debug_avg_weight_magnitude = 0.0
+var float debug_weight_change_rate = 0.0
+var float debug_replay_diversity = 0.0
 
 // 2. Адаптивный расчет периода обучения
 max_training_bars = 5000
@@ -492,33 +520,44 @@ calc_attention_weights(int seq_len, array<float> current_hidden, array<float> ls
         dot_product = 0.0
         for i = 0 to lstm_hidden_size - 1
             dot_product += array.get(current_hidden, i) * array.get(lstm_hidden_history, t * lstm_hidden_size + i)
+        
+        // 🛡️ ЗАЩИТА: Ограничиваем dot_product, чтобы math.exp не стал бесконечностью
+        dot_product := math.max(-10.0, math.min(10.0, dot_product))
+        
         w = math.exp(dot_product) * 0.8
         array.set(attn_weights, t, w)
         attn_sum += w
-    for t = 0 to seq_len - 1
-        old_w = array.get(attn_weights, t)
-        array.set(attn_weights, t, old_w / attn_sum)
+    
+    // Нормализация (с защитой от деления на 0)
+    if attn_sum > 1e-10
+        for t = 0 to seq_len - 1
+            old_w = array.get(attn_weights, t)
+            array.set(attn_weights, t, old_w / attn_sum)
+    
     attn_weights
 //==================================================================================================================================
-lstm_forward(array<float> inputs, int seq_len, int input_dim) =>
-    // 1. Копируем текущие состояния для работы внутри функции
-    array<float> current_hidden = array.copy(lstm_hidden_state)
-    array<float> current_cell = array.copy(lstm_cell_state)
+lstm_forward(array<float> inputs, int seq_len, int input_dim, bool is_training = false) =>
+    // 1. ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ
+    // Важно: при обучении всегда начинаем с чистого листа (нулевая память).
+    // При инференсе (реальная торговля) продолжаем с прошлого состояния.
+    array<float> current_hidden = is_training ? array.new_float(lstm_hidden_size, 0.0) : array.copy(lstm_hidden_state)
+    array<float> current_cell    = is_training ? array.new_float(lstm_hidden_size, 0.0) : array.copy(lstm_cell_state)
 
     // 2. Расчет весов Attention
+    // Примечание: Для обучения attention лучше считать на лету или не использовать его совсем, 
+    // так как он добавляет сложность в Backprop. Но если оставляем:
     array<float> attn_weights = calc_attention_weights(seq_len, current_hidden, lstm_hidden_history)
     float attn_sum = 0.0
     
     for t = 0 to seq_len - 1
         attn_sum += array.get(attn_weights, t)
 
-    // Нормализация attention весов
     if attn_sum > 0
         for t = 0 to seq_len - 1
-            array.set(attn_weights, t, array.get(attn_weights, t)/ attn_sum)
+            array.set(attn_weights, t, array.get(attn_weights, t) / attn_sum)
 
-    // 3. Подготовка глобальных массивов истории
-    // Очищаем глобальные массивы перед заполнением (они уже созданы и имеют нужный размер)
+    // 3. ПОДГОТОВКА ГЛОБАЛЬНЫХ МАССИВОВ
+    // Всегда очищаем перед заполнением, так как backpropagation читает именно их
     array.fill(lstm_hidden_history, 0.0)
     array.fill(lstm_cell_history, 0.0)
     array.fill(lstm_forget_history, 0.0)
@@ -526,9 +565,8 @@ lstm_forward(array<float> inputs, int seq_len, int input_dim) =>
     array.fill(lstm_candidate_history, 0.0)
     array.fill(lstm_output_history, 0.0)
 
-    // 4. Основной цикл Forward Pass по временным шагам
+    // 4. Основной цикл Forward Pass
     for t = 0 to seq_len - 1
-        // Временные массивы для гейтов текущего шага
         array<float> forget_gates = array.new_float(lstm_hidden_size, 0.0)
         array<float> input_gates = array.new_float(lstm_hidden_size, 0.0)
         array<float> cell_candidates = array.new_float(lstm_hidden_size, 0.0)
@@ -538,7 +576,6 @@ lstm_forward(array<float> inputs, int seq_len, int input_dim) =>
 
         float attn_weight = array.get(attn_weights, t)
 
-        // Цикл по нейронам скрытого слоя
         for i = 0 to lstm_hidden_size - 1
             // --- Forget Gate ---
             float input_sum_forget = 0.0
@@ -572,12 +609,13 @@ lstm_forward(array<float> inputs, int seq_len, int input_dim) =>
             float output_gate = sigmoid(input_sum_output + array.get(current_hidden, i) * array.get(lstm_output_weights_h, i) + array.get(lstm_output_bias, i))
             array.set(output_gates, i, output_gate)
 
-            // --- Обновление состояния ячейки и скрытого состояния ---
+            // --- Update State ---
             float cell = array.get(current_cell, i) * forget + input_gate * cell_candidate
             array.set(new_cell, i, cell)
             array.set(new_hidden, i, output_gate * my_tanh(cell))
 
-        // 5. Сохраняем историю в ГЛОБАЛЬНЫЕ массивы (доступны для backpropagation)
+        // 5. Сохраняем историю в ГЛОБАЛЬНЫЕ массивы
+        // Это работает и для обучения, и для инференса
         for i = 0 to lstm_hidden_size - 1
             array.set(lstm_hidden_history, t * lstm_hidden_size + i, array.get(new_hidden, i))
             array.set(lstm_cell_history, t * lstm_hidden_size + i, array.get(new_cell, i))
@@ -586,20 +624,18 @@ lstm_forward(array<float> inputs, int seq_len, int input_dim) =>
             array.set(lstm_candidate_history, t * lstm_hidden_size + i, array.get(cell_candidates, i))
             array.set(lstm_output_history, t * lstm_hidden_size + i, array.get(output_gates, i))
 
-        // Обновляем текущие состояния для следующего временного шага t
         current_cell := new_cell
         current_hidden := new_hidden
 
-    // 6. Финальное обновление глобальных состояний для следующего бара
-    // ИСПРАВЛЕНИЕ ОШИБКИ: Копируем значения в существующие глобальные массивы
-    // вместо присваивания новых массивов (lstm_cell_state := ...)
-    for i = 0 to lstm_hidden_size - 1
-        array.set(lstm_cell_state, i, array.get(current_cell, i))
-        array.set(lstm_hidden_state, i, array.get(current_hidden, i))
+    // 6. Финальное обновление
+    // ТОЛЬКО при инференсе обновляем глобальную память агента.
+    // При обучении НЕ трогаем глобальную память, чтобы не ломать текущее состояние агента.
+    if not is_training
+        for i = 0 to lstm_hidden_size - 1
+            array.set(lstm_cell_state, i, array.get(current_cell, i))
+            array.set(lstm_hidden_state, i, array.get(current_hidden, i))
 
-    // Возвращаем последнее скрытое состояние
     current_hidden
-
 //====================================================================================
 var float raw_input1 = na
 var float raw_input2 = na
@@ -840,59 +876,73 @@ if use_nn_filter
     array.shift(input_history)
     array.push(input_history, combined_input)
 //**************************************************************************************************************************************************
-
 //── Inputs DQN (расширенные от вашего RL)
 episode_len = input.int(200, "Episode Length (bars)", minval=50, group="DQN")
-epsilon     = input.float(0.10, "ε-greedy exploration", minval=0.0, maxval=1.0, group="DQN")
-//rl_lr       = input.float(0.001, "Q-network learning-rate", group="DQN")  // Уменьшено для NN
+float epsilon_start = input.float(0.10, "ε-greedy exploration", minval=0.0, maxval=1.0, group="DQN")
+var float epsilon = epsilon_start 
 rl_gamma    = input.float(0.99, "Discount γ", group="DQN")
-history_len = input.int(5, "State History Length (bars)", minval=2, maxval=5, group="DQN")
-replay_size = input.int(70000, "Replay Buffer Size", minval=100, group="DQN")
+//history_len = input.int(20, "State History Length (bars)", minval=8, maxval=20, group="DQN")
+replay_size = input.int(1000, "Replay Buffer Size", minval=100, group="DQN") 
 train_freq  = input.int(10, "Training Frequency (bars)", minval=1, group="DQN")
+batch_size = input.int(6, "Batch Size", group="SuperTrend", minval=1)
 
 type State 
     array<float> features
 type StateHistory 
     array<State> history
 
-//── Новый выходной слой для Q-значений (добавьте в вашу NN-инициализацию)
+//── Веса Main сети
 var float[] weights_hidden4_q = array.new_float(hidden_neurons4_nn4 * num_actions, math.random(0.2) - 0.1)
-
 var float[] biases_q = array.new_float(num_actions, 0.01)
-//── Счётчик уникальных состояний (адаптирован для сырых)
-var bool[] visited_states = array.new_bool(100000, false)  // Ограниченный размер
+
+//── Веса Target сети (для стабильности DQN)
+var float[] weights_hidden4_q_target = array.new_float(hidden_neurons4_nn4 * num_actions, 0.0)
+var float[] biases_q_target = array.new_float(num_actions, 0.0)
+// Target MLP weights
+var float[] weights_input_hidden1_target = array.new_float(hidden_neurons1_nn4 * input_size_nn4, 0.0)
+var float[] biases_hidden1_target = array.new_float(hidden_neurons1_nn4, 0.0)
+var float[] weights_hidden1_hidden2_target = array.new_float(hidden_neurons2_nn4 * hidden_neurons1_nn4, 0.0)
+var float[] biases_hidden2_target = array.new_float(hidden_neurons2_nn4, 0.0)
+var float[] weights_hidden2_hidden3_target = array.new_float(hidden_neurons3_nn4 * hidden_neurons2_nn4, 0.0)
+var float[] biases_hidden3_target = array.new_float(hidden_neurons3_nn4, 0.0)
+var float[] weights_hidden3_hidden4_target = array.new_float(hidden_neurons4_nn4 * hidden_neurons3_nn4, 0.0)
+var float[] biases_hidden4_target = array.new_float(hidden_neurons4_nn4, 0.0)
+
+//── Счётчик состояний
+var bool[] visited_states = array.new_bool(100000, false)
 var int visited_count = 0
+
 //── Persistent
 var int   rl_bar   = 0
-//var float rl_eq0   = na
 var State prev_state = na
 var int   rl_prevA = na
 var int replay_pointer = 0
 var int replay_fill = 0
-// Q-output layer
-// Adam-arrays для Q-layer (добавьте после объявления weights_hidden4_q и biases_q)
+
+// Adam-arrays для Q-layer
 var float[] m_weights_hidden4_q = array.new_float(array.size(weights_hidden4_q), 0.0)
 var float[] v_weights_hidden4_q = array.new_float(array.size(weights_hidden4_q), 0.0)
 var float[] m_biases_q = array.new_float(array.size(biases_q), 0.0)
 var float[] v_biases_q = array.new_float(array.size(biases_q), 0.0)
-// Объявление (добавьте, если не существует)
+
 array<float> q_next = na
 float ignored1 = na 
 float ignored2 = na 
 var array<float> q_pred = na
+
 // =======================================================================
-// ИНИЦИАЛИЗАЦИЯ ВЕСОВ (ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ)
+// ИНИЦИАЛИЗАЦИЯ ВЕСОВ
 // =======================================================================
 
-force_reinit = input.bool(true, "Force Reinit Weights", group="ML Settings")
+force_reinit = input.bool(false, "Force Reinit Weights", group="ML Settings")
 var bool weights_initialized = false
 
-bool should_init = (barstate.isfirst and not weights_initialized) or force_reinit
+bool should_init = (barstate.isfirst and not weights_initialized) or (force_reinit and not weights_initialized)
 
 if should_init
     weights_initialized := true
     
-    // ═══ MLP ВЕСА ═══
+    // ═══ MLP ВЕСА (MAIN) ═══
     array.clear(weights_input_hidden1)
     for i = 0 to (input_size_nn4 * hidden_neurons1_nn4) - 1
         array.push(weights_input_hidden1, math.random(-0.1, 0.1))
@@ -928,160 +978,27 @@ if should_init
     for i = 0 to num_actions - 1
         array.push(biases_q, 0.0)
     
-    // ═══ LSTM ВЕСА ═══
-    if use_lstm
-        array.clear(lstm_forget_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(lstm_forget_weights_i, math.random(-0.1, 0.1))
-        array.clear(lstm_forget_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_forget_weights_h, math.random(-0.1, 0.1))
-        array.clear(lstm_forget_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_forget_bias, 0.0)
-        
-        array.clear(lstm_input_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(lstm_input_weights_i, math.random(-0.1, 0.1))
-        array.clear(lstm_input_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_input_weights_h, math.random(-0.1, 0.1))
-        array.clear(lstm_input_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_input_bias, 0.0)
-        
-        array.clear(lstm_cell_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(lstm_cell_weights_i, math.random(-0.1, 0.1))
-        array.clear(lstm_cell_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_cell_weights_h, math.random(-0.1, 0.1))
-        array.clear(lstm_cell_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_cell_bias, 0.0)
-        
-        array.clear(lstm_output_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(lstm_output_weights_i, math.random(-0.1, 0.1))
-        array.clear(lstm_output_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_output_weights_h, math.random(-0.1, 0.1))
-        array.clear(lstm_output_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(lstm_output_bias, 0.0)
-    
-    // ═══ ADAM МОМЕНТЫ ДЛЯ MLP ═══
-    array.clear(m_weights_input_hidden1)
-    array.clear(v_weights_input_hidden1)
-    for i = 0 to (input_size_nn4 * hidden_neurons1_nn4) - 1
-        array.push(m_weights_input_hidden1, 0.0)
-        array.push(v_weights_input_hidden1, 0.0)
-    
-    array.clear(m_weights_hidden1_hidden2)
-    array.clear(v_weights_hidden1_hidden2)
-    for i = 0 to (hidden_neurons1_nn4 * hidden_neurons2_nn4) - 1
-        array.push(m_weights_hidden1_hidden2, 0.0)
-        array.push(v_weights_hidden1_hidden2, 0.0)
-    
-    array.clear(m_weights_hidden2_hidden3)
-    array.clear(v_weights_hidden2_hidden3)
-    for i = 0 to (hidden_neurons2_nn4 * hidden_neurons3_nn4) - 1
-        array.push(m_weights_hidden2_hidden3, 0.0)
-        array.push(v_weights_hidden2_hidden3, 0.0)
-    
-    array.clear(m_weights_hidden3_hidden4)
-    array.clear(v_weights_hidden3_hidden4)
-    for i = 0 to (hidden_neurons3_nn4 * hidden_neurons4_nn4) - 1
-        array.push(m_weights_hidden3_hidden4, 0.0)
-        array.push(v_weights_hidden3_hidden4, 0.0)
-    
-    array.clear(m_weights_hidden4_q)
-    array.clear(v_weights_hidden4_q)
-    for i = 0 to (hidden_neurons4_nn4 * num_actions) - 1
-        array.push(m_weights_hidden4_q, 0.0)
-        array.push(v_weights_hidden4_q, 0.0)
-    
-    // ═══ ADAM МОМЕНТЫ ДЛЯ LSTM ═══
-    if use_lstm
-        array.clear(m_lstm_forget_weights_i)
-        array.clear(v_lstm_forget_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(m_lstm_forget_weights_i, 0.0)
-            array.push(v_lstm_forget_weights_i, 0.0)
-        
-        array.clear(m_lstm_forget_weights_h)
-        array.clear(v_lstm_forget_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_forget_weights_h, 0.0)
-            array.push(v_lstm_forget_weights_h, 0.0)
-        
-        array.clear(m_lstm_forget_bias)
-        array.clear(v_lstm_forget_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_forget_bias, 0.0)
-            array.push(v_lstm_forget_bias, 0.0)
-        
-        array.clear(m_lstm_input_weights_i)
-        array.clear(v_lstm_input_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(m_lstm_input_weights_i, 0.0)
-            array.push(v_lstm_input_weights_i, 0.0)
-        
-        array.clear(m_lstm_input_weights_h)
-        array.clear(v_lstm_input_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_input_weights_h, 0.0)
-            array.push(v_lstm_input_weights_h, 0.0)
-        
-        array.clear(m_lstm_input_bias)
-        array.clear(v_lstm_input_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_input_bias, 0.0)
-            array.push(v_lstm_input_bias, 0.0)
-        
-        array.clear(m_lstm_cell_weights_i)
-        array.clear(v_lstm_cell_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(m_lstm_cell_weights_i, 0.0)
-            array.push(v_lstm_cell_weights_i, 0.0)
-        
-        array.clear(m_lstm_cell_weights_h)
-        array.clear(v_lstm_cell_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_cell_weights_h, 0.0)
-            array.push(v_lstm_cell_weights_h, 0.0)
-        
-        array.clear(m_lstm_cell_bias)
-        array.clear(v_lstm_cell_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_cell_bias, 0.0)
-            array.push(v_lstm_cell_bias, 0.0)
-        
-        array.clear(m_lstm_output_weights_i)
-        array.clear(v_lstm_output_weights_i)
-        for i = 0 to (lstm_hidden_size * input_dim) - 1
-            array.push(m_lstm_output_weights_i, 0.0)
-            array.push(v_lstm_output_weights_i, 0.0)
-        
-        array.clear(m_lstm_output_weights_h)
-        array.clear(v_lstm_output_weights_h)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_output_weights_h, 0.0)
-            array.push(v_lstm_output_weights_h, 0.0)
-        
-        array.clear(m_lstm_output_bias)
-        array.clear(v_lstm_output_bias)
-        for i = 0 to lstm_hidden_size - 1
-            array.push(m_lstm_output_bias, 0.0)
-            array.push(v_lstm_output_bias, 0.0)
-         
+    // ═══ ИНИЦИАЛИЗАЦИЯ TARGET ВЕСОВ (Копия Main) ═══
+    // ИСПРАВЛЕНО: Используем присваивание результата array.copy()
+    weights_input_hidden1_target := array.copy(weights_input_hidden1)
+    biases_hidden1_target := array.copy(biases_hidden1)
+    weights_hidden1_hidden2_target := array.copy(weights_hidden1_hidden2)
+    biases_hidden2_target := array.copy(biases_hidden2)
+    weights_hidden2_hidden3_target := array.copy(weights_hidden2_hidden3)
+    biases_hidden3_target := array.copy(biases_hidden3)
+    weights_hidden3_hidden4_target := array.copy(weights_hidden3_hidden4)
+    biases_hidden4_target := array.copy(biases_hidden4)
+    weights_hidden4_q_target := array.copy(weights_hidden4_q)
+    biases_q_target := array.copy(biases_q)
+
 //*****************************************************************************************************************************************************
-dqn_forward(array<State> state_seq) =>
+// Функция Forward Pass (Main/Target switch)
+// ИСПРАВЛЕНО: Добавлено значение по умолчанию false
+dqn_forward(array<State> state_seq, bool use_target_weights = false, bool is_training_pass = false) =>
     int seq_len = array.size(state_seq)
     if seq_len == 0
         [array.new<float>(num_actions, 0.0), 0.5]
     
-    // Создаем flat_input
     array<float> flat_input = array.new<float>(seq_len * num_features, 0.0)
     for i = 0 to seq_len - 1
         State s = array.get(state_seq, i)
@@ -1091,123 +1008,97 @@ dqn_forward(array<State> state_seq) =>
                 val := nz(array.get(s.features, j), 0.0)
             array.set(flat_input, i * num_features + j, val)
     
-    // ═══ LSTM FORWARD (ЕСЛИ ИСПОЛЬЗУЕТСЯ) ═══
+    // LSTM Forward - передаем флаг обучения
     array<float> lstm_out = array.new<float>(0)
     if use_lstm
-        lstm_out := lstm_forward(flat_input, seq_len, input_dim)
-        
-        // Если LSTM вернул что-то → копируем в nn_inputs
+        lstm_out := lstm_forward(flat_input, seq_len, input_dim, is_training_pass)
         if array.size(lstm_out) > 0
             for i = 0 to math.min(array.size(lstm_out) - 1, lstm_hidden_size - 1)
                 int input_idx = 12 + i
                 if input_idx < input_size_nn4
-                    // Расширяем nn_inputs если нужно
                     while array.size(nn_inputs) <= input_idx
                         array.push(nn_inputs, 0.0)
                     array.set(nn_inputs, input_idx, nz(array.get(lstm_out, i), 0.0))
     
-    // ═══ ЕСЛИ LSTM НЕ ИСПОЛЬЗУЕТСЯ ИЛИ ВЕРНУЛ ПУСТО ═══
-    // Заполняем nn_inputs базовыми фичами из flat_input
     if array.size(lstm_out) == 0
         for i = 0 to math.min(array.size(flat_input) - 1, input_size_nn4 - 1)
             while array.size(nn_inputs) <= i
                 array.push(nn_inputs, 0.0)
             array.set(nn_inputs, i, nz(array.get(flat_input, i), 0.0))
     
-    // ═══ ИСПРАВЛЕНИЕ: Сохраняем входы для Backpropagation ═══
-    // Без этого шага backpropagation использует нули вместо реальных данных!
     for i = 0 to array.size(nn_inputs) - 1
         if i < array.size(nn_inputs_prev)
             array.set(nn_inputs_prev, i, array.get(nn_inputs, i))
 
-    // ═══ MLP FORWARD (ВСЕГДА ВЫПОЛНЯЕТСЯ) ═══
+    // MLP Forward
+    float[] h1_out = array.new_float(hidden_neurons1_nn4, 0.0)
+    float[] h2_out = array.new_float(hidden_neurons2_nn4, 0.0)
+    float[] h3_out = array.new_float(hidden_neurons3_nn4, 0.0)
+    float[] h4_out = array.new_float(hidden_neurons4_nn4, 0.0)
     
-    // Hidden Layer 1
+    // Layer 1
     for i = 0 to hidden_neurons1_nn4 - 1
-        float sum = nz(array.get(biases_hidden1, i), 0.0)
+        float sum = use_target_weights ? nz(array.get(biases_hidden1_target, i), 0.0) : nz(array.get(biases_hidden1, i), 0.0)
         for j = 0 to input_size_nn4 - 1
-            if j < array.size(nn_inputs) and i * input_size_nn4 + j < array.size(weights_input_hidden1)
-                sum += nz(array.get(nn_inputs, j), 0.0) * nz(array.get(weights_input_hidden1, i * input_size_nn4 + j), 0.0)
-        
-        while array.size(hidden1_output) <= i
-            array.push(hidden1_output, 0.0)
-        float h1_out = leaky_relu(sum)
-        array.set(hidden1_output, i, h1_out)
-        // ИСПРАВЛЕНИЕ: Сохраняем выходы для Backpropagation
-        if i < array.size(hidden1_output_prev)
-            array.set(hidden1_output_prev, i, h1_out)
-    
-    // Hidden Layer 2
+            float w = use_target_weights ? nz(array.get(weights_input_hidden1_target, i * input_size_nn4 + j), 0.0) : nz(array.get(weights_input_hidden1, i * input_size_nn4 + j), 0.0)
+            if j < array.size(nn_inputs)
+                sum += nz(array.get(nn_inputs, j), 0.0) * w
+        float activated = leaky_relu(sum)
+        array.set(h1_out, i, activated)
+        if not use_target_weights and i < array.size(hidden1_output_prev)
+            array.set(hidden1_output_prev, i, activated)
+
+    // Layer 2
     for i = 0 to hidden_neurons2_nn4 - 1
-        float sum = nz(array.get(biases_hidden2, i), 0.0)
+        float sum = use_target_weights ? nz(array.get(biases_hidden2_target, i), 0.0) : nz(array.get(biases_hidden2, i), 0.0)
         for j = 0 to hidden_neurons1_nn4 - 1
-            if j < array.size(hidden1_output) and i * hidden_neurons1_nn4 + j < array.size(weights_hidden1_hidden2)
-                sum += nz(array.get(hidden1_output, j), 0.0) * nz(array.get(weights_hidden1_hidden2, i * hidden_neurons1_nn4 + j), 0.0)
-        
-        while array.size(hidden2_output) <= i
-            array.push(hidden2_output, 0.0)
-        float h2_out = leaky_relu(sum)
-        array.set(hidden2_output, i, h2_out)
-        // ИСПРАВЛЕНИЕ: Сохраняем выходы для Backpropagation
-        if i < array.size(hidden2_output_prev)
-            array.set(hidden2_output_prev, i, h2_out)
-    
-    // Hidden Layer 3
+            float w = use_target_weights ? nz(array.get(weights_hidden1_hidden2_target, i * hidden_neurons1_nn4 + j), 0.0) : nz(array.get(weights_hidden1_hidden2, i * hidden_neurons1_nn4 + j), 0.0)
+            sum += nz(array.get(h1_out, j), 0.0) * w
+        float activated = leaky_relu(sum)
+        array.set(h2_out, i, activated)
+        if not use_target_weights and i < array.size(hidden2_output_prev)
+            array.set(hidden2_output_prev, i, activated)
+            
+    // Layer 3
     for i = 0 to hidden_neurons3_nn4 - 1
-        float sum = nz(array.get(biases_hidden3, i), 0.0)
+        float sum = use_target_weights ? nz(array.get(biases_hidden3_target, i), 0.0) : nz(array.get(biases_hidden3, i), 0.0)
         for j = 0 to hidden_neurons2_nn4 - 1
-            if j < array.size(hidden2_output) and i * hidden_neurons2_nn4 + j < array.size(weights_hidden2_hidden3)
-                sum += nz(array.get(hidden2_output, j), 0.0) * nz(array.get(weights_hidden2_hidden3, i * hidden_neurons2_nn4 + j), 0.0)
-        
-        while array.size(hidden3_output) <= i
-            array.push(hidden3_output, 0.0)
-        float h3_out = leaky_relu(sum)
-        array.set(hidden3_output, i, h3_out)
-        // ИСПРАВЛЕНИЕ: Сохраняем выходы для Backpropagation
-        if i < array.size(hidden3_output_prev)
-            array.set(hidden3_output_prev, i, h3_out)
-    
-    // Hidden Layer 4
+            float w = use_target_weights ? nz(array.get(weights_hidden2_hidden3_target, i * hidden_neurons2_nn4 + j), 0.0) : nz(array.get(weights_hidden2_hidden3, i * hidden_neurons2_nn4 + j), 0.0)
+            sum += nz(array.get(h2_out, j), 0.0) * w
+        float activated = leaky_relu(sum)
+        array.set(h3_out, i, activated)
+        if not use_target_weights and i < array.size(hidden3_output_prev)
+            array.set(hidden3_output_prev, i, activated)
+
+    // Layer 4
     for i = 0 to hidden_neurons4_nn4 - 1
-        float sum = nz(array.get(biases_hidden4, i), 0.0)
+        float sum = use_target_weights ? nz(array.get(biases_hidden4_target, i), 0.0) : nz(array.get(biases_hidden4, i), 0.0)
         for j = 0 to hidden_neurons3_nn4 - 1
-            if j < array.size(hidden3_output) and i * hidden_neurons3_nn4 + j < array.size(weights_hidden3_hidden4)
-                sum += nz(array.get(hidden3_output, j), 0.0) * nz(array.get(weights_hidden3_hidden4, i * hidden_neurons3_nn4 + j), 0.0)
-        
-        while array.size(hidden4_output) <= i
-            array.push(hidden4_output, 0.0)
-        float h4_out = leaky_relu(sum)
-        array.set(hidden4_output, i, h4_out)
-        // ИСПРАВЛЕНИЕ: Сохраняем выходы для Backpropagation
-        if i < array.size(hidden4_output_prev)
-            array.set(hidden4_output_prev, i, h4_out)
+            float w = use_target_weights ? nz(array.get(weights_hidden3_hidden4_target, i * hidden_neurons3_nn4 + j), 0.0) : nz(array.get(weights_hidden3_hidden4, i * hidden_neurons3_nn4 + j), 0.0)
+            sum += nz(array.get(h3_out, j), 0.0) * w
+        float activated = leaky_relu(sum)
+        array.set(h4_out, i, activated)
+        if not use_target_weights and i < array.size(hidden4_output_prev)
+            array.set(hidden4_output_prev, i, activated)
     
-    // ═══ Q-VALUES OUTPUT ═══
+    // Q-VALUES
     array<float> q_values = array.new<float>(num_actions, 0.0)
     for a = 0 to num_actions - 1
-        float sum = nz(array.get(biases_q, a), 0.0)
+        float sum = use_target_weights ? nz(array.get(biases_q_target, a), 0.0) : nz(array.get(biases_q, a), 0.0)
         for i = 0 to hidden_neurons4_nn4 - 1
-            if i < array.size(hidden4_output) and a * hidden_neurons4_nn4 + i < array.size(weights_hidden4_q)
-                sum += nz(array.get(hidden4_output, i), 0.0) * nz(array.get(weights_hidden4_q, a * hidden_neurons4_nn4 + i), 0.0)
+            float w = use_target_weights ? nz(array.get(weights_hidden4_q_target, a * hidden_neurons4_nn4 + i), 0.0) : nz(array.get(weights_hidden4_q, a * hidden_neurons4_nn4 + i), 0.0)
+            sum += nz(array.get(h4_out, i), 0.0) * w
         array.set(q_values, a, sum)
     
-    // ═══ NN OUTPUT (для совместимости) ═══
     float nn_output = 0.5
-    if array.size(hidden4_output) > 0
-        float output_sum = 0.0
-        for i = 0 to hidden_neurons4_nn4 - 1
-            if i < array.size(hidden4_output) and i < array.size(weights_hidden4_output)
-                output_sum += nz(array.get(hidden4_output, i), 0.0) * nz(array.get(weights_hidden4_output, i), 0.0)
-        nn_output := my_tanh(output_sum)
+    if array.size(q_values) > 0
+        nn_output := my_tanh(array.sum(q_values) / num_actions)
     
     [q_values, nn_output]
 
-
 //********************************************************************************************************************************************************
-
+// Resize Input Logic
 needed_size_nn_inputs = lstm_timesteps * input_dim
-    // Проверка и корректировка размера массива nn_inputs
-
 current_size = array.size(nn_inputs)
 if current_size < needed_size_nn_inputs
     for _ = current_size to needed_size_nn_inputs - 1
@@ -1217,6 +1108,7 @@ else if current_size > needed_size_nn_inputs
     for idx = 0 to needed_size_nn_inputs - 1
         array.set(new_nn_inputs, idx, array.get(nn_inputs, idx))
     nn_inputs := new_nn_inputs
+
 //***********************************************************************************************************************************************************
 array_argmax(array<float> arr) =>
     int idx = 0
@@ -1227,27 +1119,27 @@ array_argmax(array<float> arr) =>
             maxVal := val
             idx := i
     idx
-//*******************************************************************// 10. SuperTrend: pine_supertrend (принимает factor series float, atr series float — ATR value, не length)
-// Функция pine_supertrend (улучшенная версия с var для persistence)
+
+//******************************************************************* 
+// 10. SuperTrend: pine_supertrend 
+// Функция определена ЗДЕСЬ, чтобы была доступна до вызова
 pine_supertrend(factor, atr) =>
-    src = hlc3  // Источник: hlc3 или hl2/close — подставь свой
-    atr_val = nz(atr, 0.0001)  // Защита от na/0
-    up = src + factor * atr_val  // Upper band
-    dn = src - factor * atr_val  // Lower band
+    src = hlc3
+    atr_val = nz(atr, 0.0001)
+    up = src + factor * atr_val
+    dn = src - factor * atr_val
     
-    var float st = na  // Persistent SuperTrend line (глобальная для функции)
-    var int dir = 0    // Direction: 1 downtrend (ST выше цены), -1 uptrend (ST ниже цены)
+    var float st = na
+    var int dir = 0
     
     prev_up = nz(up[1], up)
     prev_dn = nz(dn[1], dn)
     prev_st = nz(st[1], close)
     prev_close = nz(close[1], close)
 
-    // Корректировка bands (не меняются, если цена не пересекла)
     up := up < prev_up or prev_close > prev_up ? up : prev_up
     dn := dn > prev_dn or prev_close < prev_dn ? dn : prev_dn
 
-    // Логика тренда
     if na(prev_st)
         st := up
         dir := 1
@@ -1259,92 +1151,72 @@ pine_supertrend(factor, atr) =>
             dir := close < dn ? 1 : -1
             st := dir == -1 ? dn : up
 
-    [nz(st, close), nz(dir, 1)]  // Возврат [SuperTrend line, direction]
+    [nz(st, close), nz(dir, 1)]
 
 // 9. Адаптивный фактор ATR с NN-фильтром
-float vol_roc = ta.roc(ta.atr(roc_length), roc_length)  // Скорость изменения короткого ATR
-vol_roc := nz(vol_roc, 0)  // Без na
-// --- Добавленные ATR (вставь здесь) ---
+float vol_roc = ta.roc(ta.atr(roc_length), roc_length)
+vol_roc := nz(vol_roc, 0)
 var int atr_fast_len = 3
 var int atr_normal_len = 10
 atr3 = ta.atr(atr_fast_len)
-volatility_index = atr50 != 0 ? atr10 / atr50 : 1.0  // Базовый индекс
-// Сглаженный индекс для плавности
+volatility_index = atr50 != 0 ? atr10 / atr50 : 1.0
 float smoothed_index = ta.ema(volatility_index, smooth_factor)
-// Continuous функция для factor (sigmoid для плавных переходов, вместо порогов)
-float adjust = 1.0 + (vol_roc / 100.0) * (nn_filter_value > 0.5 ? 1.5 : 1.0)  // Усиливаем от ROC и NN
-float dynamic_multiplier = 1 / (1 + math.exp(-smoothed_index + 1.0))  // Sigmoid: 0-1, отзывчиво к изменениям
+float adjust = 1.0 + (vol_roc / 100.0) * (nn_filter_value > 0.5 ? 1.5 : 1.0)
+float dynamic_multiplier = 1 / (1 + math.exp(-smoothed_index + 1.0))
 dynamic_factor = adaptive_factor ? best_basefact * (0.8 + dynamic_multiplier * adjust) : best_basefact
-// --- Добавленный fast_vol_boost (вставь здесь) ---
 fast_vol_boost = atr10 != 0 ? math.pow(atr3 / atr10, 0.3) : 1.0
-dynamic_factor := dynamic_factor * fast_vol_boost  // Умножаем
-nn_confidence = nn_filter_value  // Или твой расчёт
+dynamic_factor := dynamic_factor * fast_vol_boost
+nn_confidence = nn_filter_value
 
 // =======================================================================
-// REINFORCEMENT LEARNING (Q-LEARNING) - ИСПРАВЛЕННАЯ ВЕРСИЯ
-// ======================================================================
+// REINFORCEMENT LEARNING (DQN) - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// =======================================================================
 
-// ───────── 1. Инициализация переменных ─────────
 var float[] rl_actions = array.from(0.30, 0.40, 0.50, 0.70, 0.90, 1.00, 1.20, 1.50)
 float seg_w = 0.05
 
 // Replay buffers
 var array<StateHistory> replay_state = array.new<StateHistory>(replay_size) 
-var array<int> replay_action = array.new<int>(replay_size)
-var array<float> replay_reward = array.new<float>(replay_size)
+var array<int> replay_action = array.new_int(replay_size)
+var array<float> replay_reward = array.new_float(replay_size)
 var array<StateHistory> replay_next_state = array.new<StateHistory>(replay_size)
 var array<float> replay_priority = array.new_float(replay_size, 1.0)
 
-// PER настройки
 var float priority_alpha = 0.6
 var float priority_eps = 1e-5
-
-// История состояний
 var StateHistory prev_history = na
 var array<State> state_history = array.new<State>(history_len)
 
-// ───────── 2. Инициализация на первом баре ─────────
 if barstate.isfirst
-    // Инициализация цены входа
-    //rl_eq0 := close
-    
-    // Пустое состояние
     State init_st = State.new()
     init_st.features := array.new<float>(num_features, 0.0)
-    
-    // Пустая история
     StateHistory init_hist = StateHistory.new()
     init_hist.history := array.new<State>(history_len)
     for j = 0 to history_len - 1
         array.set(init_hist.history, j, init_st)
-    
-    // Заполнение replay buffer
     for i = 0 to replay_size - 1
         array.set(replay_state, i, init_hist)
         array.set(replay_action, i, 0)
         array.set(replay_reward, i, 0.0)
         array.set(replay_next_state, i, init_hist)
         array.set(replay_priority, i, 1.0)
-    
-    // Заполнение state_history
     for i = 0 to history_len - 1
         array.set(state_history, i, init_st)
 
-// ───────── 3. Формирование признаков текущего бара ─────────
 float atr_fast = ta.atr(3)
 float atr_slow = ta.atr(14)
 float atr_ratio = nz(atr_slow != 0 ? atr_fast / atr_slow : 1.0, 1.0)
 float nn_conf_vel = nz(nn_confidence - nn_confidence[3], 0.0)
 
-array<float> cur_features = array.from(nz(volatility_index, 1.0), input1, nz(nn_confidence, 0.5), atr_ratio,nz(heidelberg_vol, 0.0))
+// Используем глобальные переменные: volatility_index, input1, nn_confidence, heidelberg_vol
+// Без заглушек - переменные должны быть определены выше в скрипте
+array<float> cur_features = array.from(nz(volatility_index, 1.0), nz(input1, close), nz(nn_confidence, 0.5), atr_ratio, nz(heidelberg_vol, 0.0))
 
-// ───────── 4. Обновление state_history ─────────
 State cur_state = State.new()
 cur_state.features := cur_features
 array.shift(state_history)
 array.push(state_history, cur_state)
 
-// ───────── 5. Учёт посещённых состояний ─────────
 int rl_state = 0
 for i = 0 to history_len - 1
     array<float> f = array.get(state_history, i).features
@@ -1356,19 +1228,16 @@ if not array.get(visited_states, rl_state)
     array.set(visited_states, rl_state, true)
     visited_count += 1
 
-// ───────── 6. Статус готовности ─────────
 float fill_pct = (visited_count / array.size(visited_states)) * 100
 bool is_ready = fill_pct > 60
 
 if barstate.islast and rl_bar % 100 == 0
-    label.new(bar_index, high, str.tostring(fill_pct, "%.1f") + "% visited", 
-              color=color.blue, style=label.style_label_down)
+    label.new(bar_index, high, str.tostring(fill_pct, "%.1f") + "% visited", color=color.blue, style=label.style_label_down)
 
 if is_ready and barstate.islast
-    label.new(bar_index, low, "Agent ready (>60%)", 
-              color=color.green, style=label.style_label_up)
+    label.new(bar_index, low, "Agent ready (>60%)", color=color.green, style=label.style_label_up)
 
-// ───────── 7. ε-greedy выбор действия ─────────
+// Action Selection
 epsilon := math.max(0.02, epsilon * 0.999)
 int rl_act = 0
 var array<float> q_vals = na
@@ -1378,10 +1247,9 @@ if math.random() < epsilon
     rl_act := int(math.random(0, num_actions - 1))
     nn_out := 0.0
 else
-    [q_vals, nn_out] = dqn_forward(state_history)
+    [q_vals, nn_out] = dqn_forward(state_history, false)
     rl_act := array_argmax(q_vals)
 
-// ───────── 8. NN-фильтр ─────────
 nn_filter_value := 1.0 + nn_out * 0.5
 
 // ───────── 9. Генерация коэффициента ─────────
@@ -1395,16 +1263,16 @@ float jitter = (math.random() - 0.5) * 2 * seg_w
 float rl_factor = math.max(0.30, math.min(base_val + jitter, 1.50))
 dynamic_factor := dynamic_factor * rl_factor
 
-// ───────── 10. Итоговый множитель ─────────
 float default_factor = base_fact
 float base_cs = nz(best_basefact, default_factor)
 float base_factor_to_use = default_factor
 raw_factor = dynamic_factor * nn_filter_value * (use_base_factor ? base_factor_to_use : 1.0) 
 final_factor = math.max(0.1, math.min(raw_factor, 3.0))
 
+// --- ВЫЗОВ SUPERTREND ---
+[st, dir_val] = pine_supertrend(final_factor, final_centroid)
 
 //******************************************************************************************************************************************************
-[st, dir_val] = pine_supertrend(final_factor, final_centroid)
 
 bool crossUp = close > st and close[1] <= st[1]
 bool crossDown = close < st and close[1] >= st[1]
@@ -1412,29 +1280,47 @@ bool crossDown = close < st and close[1] >= st[1]
 bool buy_signal = crossUp and barstate.isconfirmed and not na(final_centroid)
 bool sell_signal = crossDown and barstate.isconfirmed and not na(final_centroid)
 
-
-// ВАЖНО: Этот блок должен выполняться ПОСЛЕ расчета SuperTrend
+// ВАЖНО: Обновление счетчика баров
 rl_bar += 1
 
 // 1. Пытаемся сохранить переход в буфер (используем данные с ПРОШЛОГО бара)
 if not na(prev_history) and not na(rl_prevA)
-    // ═══ ЛОГИКА НАГРАДЫ ═══
-    float price_return = (close - close[1]) / math.max(close[1], 1e-10)
+    // ═══ ЛОГИКА НАГРАДЫ (RISK-ADJUSTED v2 - NaN Safe) ═══
+    
     int prev_dir = dir_val[1] 
     bool prev_crossUp = crossUp[1]
     bool prev_crossDown = crossDown[1]
-    
-    float reward = 0.0
+
+    // --- 1. Безопасный ATR ---
+    float current_atr = ta.atr(14)
+    current_atr := na(current_atr) or current_atr < 0.0001 ? 0.0001 : current_atr
+
+    // --- 2. Движение цены ---
+    float price_move = (close - close[1]) / current_atr
+
+    // --- 3. Базовая прибыль ---
+    float base_profit = 0.0
     if prev_dir == -1 // Long
-        reward := price_return * 100.0
+        base_profit := price_move
     else if prev_dir == 1 // Short
-        reward := -price_return * 100.0
+        base_profit := -price_move
+
+    // --- 4. Штраф за транзакции ---
+    bool did_trade = prev_crossUp or prev_crossDown
+    float cost_per_trade = 0.3
+    if did_trade
+        base_profit -= cost_per_trade
+
+    // --- 5. Итоговая награда ---
+    float reward = base_profit
     
-    // Штраф за пилу
-    if prev_crossUp and price_return < 0
-        reward -= 1.5
-    else if prev_crossDown and price_return > 0
-        reward -= 1.5
+    // 🛡️ ЗАЩИТА: Если вдруг награда NaN (мат. ошибка), ставим 0
+    if na(reward)
+        reward := 0.0
+
+    // Клиппинг (ограничение) награды
+    float reward_clip_val = 1.5
+    reward := math.max(-reward_clip_val, math.min(reward_clip_val, reward))
 
     // Сохранение в буфер
     array.set(replay_state, replay_pointer, prev_history)
@@ -1453,7 +1339,6 @@ if not na(prev_history) and not na(rl_prevA)
 
 // ═══ КРИТИЧЕСКИ ВАЖНО: ОБНОВЛЕНИЕ СОСТОЯНИЙ (ВНЕ if!) ═══
 // Этот код должен выполняться КАЖДЫЙ бар, чтобы на следующем баре было что сохранять.
-// Если вы поместите его внутрь if (na check), он никогда не инициализируется.
 prev_history := StateHistory.new()
 prev_history.history := array.copy(state_history)
 rl_prevA := rl_act
@@ -1511,7 +1396,7 @@ decay_down  = input.float(0.95, "LR Multiplier Down (error ↑)", group = "ML Se
 min_lr      = input.float(0.0001, "Min LR", group = "ML Settings")
 max_lr      = input.float(0.05,   "Max LR", group = "ML Settings")
 // Batch size
-batch_size = input.int(6, "Batch Size", group="SuperTrend", minval=1)
+
 // Переменные для adaptive LR
 var float smooth_error_lr = na
 var float last_error_lr = na
@@ -1629,8 +1514,8 @@ adam_update(float[] param, float[] m, float[] v, float g, int idx) =>
     array.set(m, idx, m_new)
     array.set(v, idx, v_new)
  
-// Вычисляем нужный размер массива для delta_hidden
-int needed_size = lstm_timesteps * lstm_hidden_size
+// Учитываем максимум из текущего шага LSTM и глубины истории для обучения
+int needed_size = math.max(lstm_timesteps, history_len) * lstm_hidden_size
  
 // Логика изменения размера массива (безопасная)
 int current_size_local = array.size(delta_hidden)
@@ -1641,9 +1526,7 @@ if current_size_local < needed_size
         array.push(delta_hidden, 0.0)
 else if current_size_local > needed_size
     // Если массив больше нужного - создаем новый (усекаем)
-    // Важно: delta_hidden - это var, поэтому присваивание обновит ссылку
     float[] new_array = array.new_float(needed_size, 0.0)
-    // Копируем данные, чтобы не потерять градиенты (хотя при уменьшении размера старые хвосты отбрасываются)
     for idx = 0 to needed_size - 1
         array.set(new_array, idx, array.get(delta_hidden, idx))
     delta_hidden := new_array
@@ -1697,31 +1580,6 @@ apply_l2_to_accumulated_gradients(array<float> acc_grads, array<float> weights, 
             array.set(acc_grads, i, array.get(acc_grads, i) + l2_grad)
 
 //************************************************************************************************************************************************************
-// ═══════════════════════════════════════════════════════════════
-// DEBUG ПЕРЕМЕННЫЕ (ГЛОБАЛЬНЫЕ - ОСНОВНЫЕ)
-// ═══════════════════════════════════════════════════════════════
-var float debug_avg_reward = 0.0
-var float debug_avg_max_q = 0.0
-var float debug_avg_target_q = 0.0
-var float debug_avg_old_q = 0.0
-var float debug_min_td = 0.0
-var float debug_max_td = 0.0
-var int debug_zero_td_count = 0
-var bool debug_all_q_zero = false
-var bool debug_all_reward_zero = false
-
-// ═══════════════════════════════════════════════════════════════
-// DEBUG ПЕРЕМЕННЫЕ (ГЛОБАЛЬНЫЕ - ГРАДИЕНТЫ И ВЕСА)
-// ═══════════════════════════════════════════════════════════════
-var float debug_grad_norm = 0.0           // Норма градиента (общая)
-var int debug_clipping_count = 0          // Сколько раз градиенты были обрезаны
-var float debug_max_grad = 0.0            // Максимальный градиент
-var float debug_mlp_grad_norm = 0.0       // Норма градиентов MLP
-var float debug_lstm_grad_norm = 0.0      // Норма градиентов LSTM
-var float debug_l2_loss = 0.0             // L2 регуляризация (total)
-var float debug_avg_weight_magnitude = 0.0 // Средняя величина весов
-var float debug_weight_change_rate = 0.0  // Скорость изменения весов
-var float debug_replay_diversity = 0.0    // Разнообразие replay buffer
 
 // Функция для адаптивного clip_threshold_gate
 adaptive_clip_threshold_gate(float error_ema) =>
@@ -1792,12 +1650,12 @@ backpropagation(array<int> batch_indices, array<float> is_weights, int batch_len
         StateHistory sample_next_hist = array.get(replay_next_state, sample_idx)
 
         // B. Forward Next
-        [q_next, _] = dqn_forward(sample_next_hist.history)
+        [q_next, _] = dqn_forward(sample_next_hist.history,true,true)
         float max_q = array.max(q_next)
         float target_q = sample_reward + rl_gamma * max_q
 
         // C. Forward Current (обновляет скрытые слои)
-        [q_pred, _] = dqn_forward(sample_state_hist.history)
+        [q_pred, _] = dqn_forward(sample_state_hist.history, false,true)
         float old_q = array.get(q_pred, sample_act)
         
         // D. Ошибка
@@ -2188,8 +2046,10 @@ backpropagation(array<int> batch_indices, array<float> is_weights, int batch_len
     array.set(debug_stats, 4, debug_zero_td_count_local)
     
     [avg_error / batch_len_f, mlp_grad_norm, lstm_grad_norm, grad_norm, clipping_count, max_grad, total_l2, debug_stats]
+    
+//****************************************************************************************************************************************
 // =======================================================================
-// ОБУЧЕНИЕ Q-LEARNING С PER - ПОЛНЫЙ БЛОК С DEBUG (БЕЗ RUNTIME.LOG)
+// ОБУЧЕНИЕ Q-LEARNING С PER - БЛОК 1: ФУНКЦИИ И ОБУЧЕНИЕ
 // =======================================================================
 
 // ───────── Helper функция: бинарный поиск ─────────
@@ -2252,17 +2112,20 @@ per_sample_optimized(int batch_size_param, int replay_fill_param) =>
     [batch_indices, is_weights]
 
 // ───────── ОСНОВНОЙ БЛОК ОБУЧЕНИЯ (ОПТИМИЗИРОВАННЫЙ) ─────────
+// Примечание: Этот блок должен вызываться внутри условия 'if rl_bar % train_freq == 0 ...'
+// Переменные debug_... и training_error должны быть объявлены как var/global ранее.
+
 if rl_bar % train_freq == 0 and replay_fill >= batch_size
     debug_clipping_count := 0
 
     [batch_indices, is_weights] = per_sample_optimized(batch_size, replay_fill)
 
-    // Выполняем Forward, Backward и Update внутри функции
-    // Вызов функции (теперь 8 переменных слева)
+    // Выполняем Forward, Backward и Update внутри функции backpropagation
+    // Убедитесь, что функция backpropagation определена в вашем коде
     [training_error, mlp_norm, lstm_norm, grad_norm, clipping, max_grad, l2_loss, debug_stats_arr] = backpropagation(batch_indices, is_weights, batch_size)
 
     // Распаковка статистики
-    float avg_td_error = training_error // training_error уже содержит средний TD
+    float avg_td_error = training_error 
     
     debug_avg_reward      := array.get(debug_stats_arr, 0)
     debug_avg_max_q       := array.get(debug_stats_arr, 1)
@@ -2290,8 +2153,9 @@ if rl_bar % train_freq == 0 and replay_fill >= batch_size
     debug_l2_loss         := l2_loss
     td_error              := avg_td_error
 
-    // Приоритеты уже обновлены внутри backpropagation
+    // Приоритеты обновляются внутри backpropagation, здесь обновляем бету
     priority_beta := math.min(1.0, priority_beta + beta_increment)
+//***************************************************************************************************************************************
 // =======================================================================
 // ИНФОРМАЦИОННАЯ DEBUG ПАНЕЛЬ (МАСШТАБИРУЕМАЯ)
 // =======================================================================
