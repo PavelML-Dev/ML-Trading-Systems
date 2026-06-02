@@ -1,4 +1,4 @@
-# 🤖 ML SuperTrend Ultimate: Deep Q-Learning + (Novier-Stokes xortex + mp4 expls)
+# 🤖 ML SuperTrend Ultimate: Deep Q-Learning + (Novier-Stokes xortex + mp4 expmls)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-blue.svg)](https://www.tradingview.com/pine-script-docs/)
