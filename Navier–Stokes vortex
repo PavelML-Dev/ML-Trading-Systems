@@ -9,7 +9,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. КОНФИГУРАЦИЯ СРЕДЫ (РАЗДЕЛЕНИЕ НА ГАЗ И ЖИДКОСТЬ)
+# 1. КОНФИГУРАЦИЯ СРЕДЫ (РАЗДЕЛЕНИЕ НА ГАЗ И ЖИДКОСТЬ С ТЕРМОДИНАМИКОЙ)
 # ==============================================================================
 ENV_PROFILES = {
     # --- КЕРОСИН (Kerosene) ---
@@ -21,7 +21,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.015,  # Температурная чувствительность жидкости
-        "S_sutherland": 111.0  # Оставлено для совместимости
+        "S_sutherland": 111.0,  # Оставлено для совместимости
+        "kappa": 1e-4,  # Температуропроводность
+        "Cp": 2000.0  # Удельная теплоемкость, Дж/(кг*К)
     },
     # --- ВОДА (Water at 20°C) ---
     "water": {
@@ -32,7 +34,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.02,
-        "S_sutherland": 111.0
+        "S_sutherland": 111.0,
+        "kappa": 1.4e-4,
+        "Cp": 4182.0
     },
     # --- МОРСКАЯ ВОДА (Seawater) ---
     "seawater": {
@@ -43,7 +47,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.02,
-        "S_sutherland": 111.0
+        "S_sutherland": 111.0,
+        "kappa": 1.4e-4,
+        "Cp": 3993.0
     },
     # --- ГЛИЦЕРИН (Glycerin) ---
     "glycerin": {
@@ -54,7 +60,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.05,
-        "S_sutherland": 111.0
+        "S_sutherland": 111.0,
+        "kappa": 1e-4,
+        "Cp": 2430.0
     },
     # --- МАСЛО SAE 30 (Motor Oil) ---
     "oil_sae_30": {
@@ -65,7 +73,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.04,
-        "S_sutherland": 111.0
+        "S_sutherland": 111.0,
+        "kappa": 1e-4,
+        "Cp": 1900.0
     },
     # --- РТУТЬ (Mercury) ---
     "mercury": {
@@ -76,7 +86,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.005,
-        "S_sutherland": 111.0
+        "S_sutherland": 111.0,
+        "kappa": 4.5e-3,
+        "Cp": 139.0
     },
     # --- ЖИДКИЙ ВОДОРОД (Liquid Hydrogen) ---
     "liquid_hydrogen": {
@@ -87,7 +99,9 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 20.0,
         "B_andrade": 0.01,
-        "S_sutherland": 20.0
+        "S_sutherland": 20.0,
+        "kappa": 1e-3,
+        "Cp": 14300.0  # Экстремально высокая теплоемкость водорода
     },
     # --- ВОЗДУХ (Air at 20°C) - ЭТАЛОН ГАЗА ---
     "air": {
@@ -98,10 +112,11 @@ ENV_PROFILES = {
         "quantum_limit": 3.1e-10,
         "T0": 293.0,
         "B_andrade": 0.0,
-        "S_sutherland": 110.4  # Константа Сазерленда для воздуха
+        "S_sutherland": 110.4,  # Константа Сазерленда для воздуха
+        "kappa": 2e-5,
+        "Cp": 1005.0
     }
 }
-
 
 class UltimateStableEngine:
     def __init__(self, grid_shape, env_profile, spatial_size=10.0):
@@ -116,14 +131,33 @@ class UltimateStableEngine:
         self.rho = env_profile["rho"]
         self.mu_base = env_profile["mu"]
         self.T0 = env_profile["T0"]
+        self.c0 = env_profile["sound_speed"]
+        self.kappa = env_profile.get("kappa", 1e-3)
+        self.Cp = env_profile.get("Cp", 2000.0)
 
-        # Термические коэффициенты замыкания контура
-        self.beta = 0.0005  # Масштаб перехода диссипируемой энергии в скалярный нагрев
-        self.sigma = 2.0  # Скорость фоновой релаксации (охлаждения) поля температур
+        # ==============================================================================
+        # УНИВЕРСАЛЬНЫЙ ТЕРМОДИНАМИЧЕСКИЙ МАСШТАБАТОР (ДЛЯ ГАЗОВ И ЖИДКОСТЕЙ)
+        # ==============================================================================
+        # Базовая физическая величина (1 / rho * Cp)
+        beta_physical = 1.0 / (self.rho * self.Cp)
+
+        # Инженерный безразмерный буст для компенсации дискретной сетки Фурье
+        characteristic_thermal_inertia = self.rho * self.Cp
+
+        # Эмпирический масштабный инвариант, завязанный на геометрию сетки
+        grid_scale_factor = 50000.0 / (spatial_size * torch.prod(torch.tensor(grid_shape))) ** 0.25
+
+        # Итоговый адаптивный бета-коэффициент
+        self.beta = beta_physical * (1e6 / characteristic_thermal_inertia) * grid_scale_factor.item()
+
+        # Скорость охлаждения Ньютона
+        nu_kinematic = self.mu_base / self.rho
+        self.sigma = 0.2 * (nu_kinematic / 1e-5) ** 0.25
 
         # Инициализация термодинамического резервуара
         self.T = torch.full(grid_shape, self.T0, device=self.device, dtype=torch.float32)
 
+        # Построение спектральной сетки волновых чисел
         k_vectors = [
             torch.fft.fftfreq(n, d=self.dx).to(self.device) * 2.0 * torch.pi for n in grid_shape
         ]
@@ -131,7 +165,7 @@ class UltimateStableEngine:
         self.k_squared = torch.sum(self.mesh ** 2, dim=0)
         self.k_abs = torch.sqrt(self.k_squared)
 
-        # Правило 2/3 для деалиасинга
+        # Правило 2/3 для деалиасинга (Фильтр Оршага)
         k_max_dealias = torch.max(self.k_abs) * 2.0 / 3.0
         self.dealias_filter = (self.k_abs <= k_max_dealias).float()
 
@@ -139,12 +173,14 @@ class UltimateStableEngine:
         self.k_squared_inv = self.k_squared.clone()
         self.k_squared_inv[0, 0] = 1.0
 
-        # Настройка Sobolev Detector
-        self.CRITICAL_GRADIENT = 5.0
+        # Настройка нелокального детектора Соболева (Дробный шаг)
         self.FRACTAL_INDEX = 1.0 / 3.0
         k_pow = self.k_abs.clone()
         k_pow[0, 0] = 0.0
         self.fractal_multiplier = k_pow ** self.FRACTAL_INDEX
+
+        print(f"[*] Движок успешно инициализирован.")
+        print(f"[*] Профиль среды: {self.env_type} | Накат тепла self.beta = {self.beta:.4e}")
 
     def step(self, v_real, dt):
         # 0. Исходные преобразования в спектральное пространство
@@ -153,12 +189,9 @@ class UltimateStableEngine:
         # ==============================================================================
         # БАЗОВАЯ КИНЕМАТИКА: ВЫЧИСЛЕНИЕ ГРАДИЕНТОВ ДЛЯ РАДАРА, РЕОЛОГИИ И АДВЕКЦИИ
         # ==============================================================================
-        # Вычисление полных пространственных производных поля скоростей
         dv_fft = 1j * self.mesh.unsqueeze(1) * v_fft.unsqueeze(0)
         dv_real = torch.fft.ifftn(dv_fft, dim=(2, 3), norm="ortho").real
 
-        # dvdx: производные по оси X [u_x, v_x]
-        # dudy: производные по оси Y [u_y, v_y]
         dvdx = dv_real[0]
         dudy = dv_real[1]
 
@@ -171,124 +204,166 @@ class UltimateStableEngine:
         S_xy = 0.5 * (dvdx[1] + dudy[0])
 
         # ==============================================================================
-        # БЛОК 1: РАДАР СОБОЛЕВА (АНАЛИЗАТОР ГЛАДКОСТИ ЧЕРЕЗ ТЕНЗОР ДЕФОРМАЦИЙ)
+        # БЛОК 1: РАДАР СОБОЛЕВА
         # ==============================================================================
-        # Строгий расчет нормы Фробениуса для симметричного тензора S(x)
-        # Добавлен 1e-8 для стабильности градиентов около нуля
-        grad_norm_s = torch.sqrt(S_xx ** 2 + S_yy ** 2 + 2.0 * S_xy ** 2 + 1e-8)
+        v_frac_fft = v_fft * self.fractal_multiplier
+        v_frac_real = torch.fft.ifftn(v_frac_fft, dim=self.spatial_axes, norm="ortho").real
+        grad_norm_s = torch.sqrt(torch.sum(v_frac_real ** 2, dim=0))
+
+        # Статистический анализ текущего состояния потока
+        mean_grad = torch.mean(grad_norm_s)
+        std_grad = torch.std(grad_norm_s) + 1e-8
+
+        # Динамический порог: реагируем на аномалии, превышающие 3 стандартных отклонения
+        dynamic_critical_grad = mean_grad + 3.0 * std_grad
 
         radar_max = torch.max(grad_norm_s)
-        radar_alert = torch.relu((radar_max / self.CRITICAL_GRADIENT) - 1.0)
-        singularity_index = 1.0 + (radar_max / self.CRITICAL_GRADIENT).item() ** 2
+        # Радар активируется, только если локальный пик пробивает статистический лимит
+        radar_alert = torch.relu((radar_max / dynamic_critical_grad) - 1.0)
+        singularity_index = 1.0 + (radar_max / dynamic_critical_grad).item() ** 2
 
-        # Локальная карта опасности: реагирует только на истинное сжатие/сдвиг слоев
-        gamma_field = 1.0 + (grad_norm_s / self.CRITICAL_GRADIENT) ** 3
+        # Локальная карта опасности для модификации вязкости
+        gamma_field = 1.0 + torch.relu((grad_norm_s / dynamic_critical_grad) - 1.0) ** 3
 
         # ==============================================================================
-        # БЛОК 2: ДИНАМИЧЕСКАЯ РЕОЛОГИЯ И ОПЕРАТОР ПЕРЕМЕННОЙ ВЯЗКОСТИ
+        # БЛОК 2: ДИНАМИЧЕСКАЯ РЕОЛОГИЯ + ПОДСЕТОЧНАЯ МОДЕЛЬ СМАГОРИНСКОГО (LES SGS)
         # ==============================================================================
+        # 1. Определение базовой молекулярной вязкости в зависимости от среды
         if self.env_type == "GAS":
-            # Закон Сазерленда: вязкость газа растет при нагревании
-            S = self.env.get("S_sutherland", 111.0)
-            nu_base = (self.mu_base / self.rho) * ((self.T / self.T0) ** 1.5) * ((self.T0 + S) / (self.T + S))
+            S_suth = self.env.get("S_sutherland", 111.0)
+            nu_base = (self.mu_base / self.rho) * ((self.T / self.T0) ** 1.5) * ((self.T0 + S_suth) / (self.T + S_suth))
         else:
-            # Закон Андраде: вязкость жидкости падает при нагревании
-            B = self.env.get("B_andrade", 0.02)
-            nu_base = (self.mu_base / self.rho) * torch.exp(-B * (self.T - self.T0))
+            B_and = self.env.get("B_andrade", 0.02)
+            nu_base = (self.mu_base / self.rho) * torch.exp(-B_and * (self.T - self.T0))
 
-        # Суперпозиция: физическая молекулярная вязкость + численная защита Соболева
-        sobolev_hyper_nu = 1e-6 * gamma_field * (grad_norm_s ** 2)
-        nu_total = nu_base + sobolev_hyper_nu
+        # 2. Расчет локальной инвариантной нормы тензора скоростей деформации |S|
+        # Формула: |S| = sqrt(2 * (S_xx^2 + S_yy^2 + 2*S_xy^2))
+        S_norm = torch.sqrt(2.0 * (S_xx ** 2 + S_yy ** 2 + 2.0 * S_xy ** 2) + 1e-12)
 
-        # Вычисление тензора вязких напряжений: Tau = 2 * nu_total * S
+        # 3. Физика подсеточных масштабов: Модель Смагоринского (LES)
+        # Насыщает низковязкие среды (водород) турбулентным трением на масштабе ячейки dx
+        C_s = 0.16
+        nu_smagorinsky = (C_s * self.dx) ** 2 * S_norm
+
+        # 4. Математика численной стабильности: Соболевская гипервязкость
+        # Включается локально только по сигналу "радара опасности" gamma_field
+        sobolev_hyper_nu = 1.5e-5 * gamma_field * (grad_norm_s ** 2)
+
+        # 5. Сборка полной эффективной вязкости потока
+        nu_total = nu_base + nu_smagorinsky + sobolev_hyper_nu
+
+        # 6. Расчет компонент анизотропного тензора вязких напряжений (Tau = 2 * nu * S)
         Tau_xx = 2.0 * nu_total * S_xx
         Tau_yy = 2.0 * nu_total * S_yy
         Tau_xy = 2.0 * nu_total * S_xy
 
-        # Перевод локальных напряжений в Фурье-пространство
-        # ИСПРАВЛЕНО: dim=(0, 1), так как Tau_xx, yy, xy — это 2D тензоры (N, N)
-        Tau_xx_fft = torch.fft.fftn(Tau_xx, dim=(0, 1), norm="ortho")
-        Tau_yy_fft = torch.fft.fftn(Tau_yy, dim=(0, 1), norm="ortho")
-        Tau_xy_fft = torch.fft.fftn(Tau_xy, dim=(0, 1), norm="ortho")
+        # 7. Трансляция тензора напряжений в спектральное пространство (Псевдоспектральный DNS)
+        # ВАЖНО: Используем self.spatial_axes, так как матрицы Tau двухмерные [Nx, Ny]
+        Tau_xx_fft = torch.fft.fftn(Tau_xx, dim=(0,1), norm="ortho")
+        Tau_yy_fft = torch.fft.fftn(Tau_yy, dim=(0,1), norm="ortho")
+        Tau_xy_fft = torch.fft.fftn(Tau_xy, dim=(0,1), norm="ortho")
 
-        # Строгое взятие дивергенции тензора напряжений в спектральном базисе
+        # 8. Взятие спектральной дивергенции тензора напряжений (расчет правых частей сил вязкости)
+        # Железно инициализируем переменные, чтобы Блок 3 их видел!
         rhs_fft_visc_u = 1j * self.mesh[0] * Tau_xx_fft + 1j * self.mesh[1] * Tau_xy_fft
         rhs_fft_visc_v = 1j * self.mesh[0] * Tau_xy_fft + 1j * self.mesh[1] * Tau_yy_fft
 
         # ==============================================================================
-        # БЛОК 3: АДВЕКЦИЯ И СОЛЕНОИДАЛЬНАЯ ПРОЕКЦИЯ ЛЕРЕ
+        # БЛОК 3: НЕЛИНЕЙНАЯ АДВЕКЦИЯ И СОЛЕНОИДАЛЬНАЯ ПРОЕКЦИЯ ЛЕРЕ
         # ==============================================================================
+        # 1. Выделение памяти под тензор нелинейных правых частей сил в реальном пространстве
         rhs_real = torch.zeros_like(v_real)
 
-        # Конвекция (Адвекция импульса)
-        rhs_real[0] = -(u[0] * dvdx[0] + v[0] * dudy[0])
-        rhs_real[1] = -(u[0] * dvdx[1] + v[0] * dudy[1])
+        # 2. Неконсервативная схема адвекции импульса: F = -(v * grad)v
+        rhs_real[0] = -(u[0] * dvdx[0] + v[0] * dudy[0])  # Компонента U
+        rhs_real[1] = -(u[0] * dvdx[1] + v[0] * dudy[1])  # Компонента V
 
-        # Vorticity Confinement (Подкачка энергии в вихри для компенсации численной диссипации)
-        omega = dvdx[1] - dudy[0]
+        # СИСТЕМНЫЙ ФОРСИНГ: Постоянная накачка энергии, чтобы поток не затухал
+
+        # Создаем сетку координат Y для генерации сдвигового течения
+        y_coords = torch.linspace(0, 2 * torch.pi, self.grid_shape[1], device=self.device)
+        # Накачиваем энергию в крупномасштабную гармонику по оси X
+        forcing_amplitude = 0.5  # Сила постоянного толчка
+        rhs_real[0] += forcing_amplitude * torch.sin(4.0 * y_coords).unsqueeze(0)
+
+        # 3. Алгоритм Vorticity Confinement (возврат энергии мелкосеточных вихрей)
+        omega = dvdx[1] - dudy[0]  # Ротор скорости (вихрь) в 2D
         abs_omega = torch.abs(omega)
         current_max_omega = torch.max(abs_omega).item()
 
+        # Динамический демпфер, чтобы сам конфайнмент не разогнал сингулярность в NaN
         damping_factor = 1.0 if current_max_omega < 100.0 else 100.0 / (current_max_omega + 1e-5)
         effective_vc = self.vc_strength * damping_factor
 
+        # Градиент модуля вихря через спектральные производные
         grad_omega_x = torch.fft.ifftn(1j * self.mesh[0] * torch.fft.fftn(abs_omega, norm="ortho"), norm="ortho").real
         grad_omega_y = torch.fft.ifftn(1j * self.mesh[1] * torch.fft.fftn(abs_omega, norm="ortho"), norm="ortho").real
-
         norm_mag = torch.sqrt(grad_omega_x ** 2 + grad_omega_y ** 2) + 1e-8
+
+        # Единичный вектор направления на центр вихря
         nx = grad_omega_x / norm_mag
         ny = grad_omega_y / norm_mag
 
+        # Добавление антидиссипативной вихревой силы в правую часть
         rhs_real[0] += effective_vc * (ny * omega)
         rhs_real[1] -= effective_vc * (nx * omega)
 
-        # Переход правой части в Фурье и деалиасинг (правило 2/3)
+        # 4. Преобразование суммарной адвективной правой части в Фурье-базис
         rhs_fft = torch.fft.fftn(rhs_real, dim=self.spatial_axes, norm="ortho")
+
+        # 5. Применение фильтра деалиасинга Оршага (правило 2/3) для подавления комбинационных частот
         rhs_fft = rhs_fft * self.dealias_filter
         v_fft_clean = v_fft * self.dealias_filter
 
-        # Добавление строгой диффузии (от переменной вязкости) в общую правую часть
+        # 6. Слияние конвективного переноса и честной тензорной вязкости (те самые переменные из Блока 2)
         rhs_fft[0] += rhs_fft_visc_u
         rhs_fft[1] += rhs_fft_visc_v
 
-        # Интегрирование по времени (явная схема Эйлера)
+        # 7. Шаг интегрирования по времени (явная схема Эйлера в спектральном пространстве)
         v_fft_next = v_fft_clean + dt * rhs_fft
 
-        # Ортогональная проекция Лере-Гельмгольца (гашение фиктивной сжимаемости)
+        # 8. Ортогональная проекция Лере-Гельмгольца (мгновенное обнуление дивергенции)
+        # Расчет дивергенции промежуточного поля скоростей
         div_v = self.mesh[0] * v_fft_next[0] + self.mesh[1] * v_fft_next[1]
+
+        # Вычитание продольной (компрессионной) составляющей вектора
         v_fft_proj = v_fft_next - self.mesh * (div_v / self.k_squared_inv).unsqueeze(0)
 
         # ==============================================================================
-        # БЛОК 4: СПЕКТРАЛЬНЫЙ ДИССИПАТОР И ТЕПЛОВОЙ КОНТУР (С АДВЕКЦИЕЙ)
+        # БЛОК 4: ПРЯМАЯ ФИЗИЧЕСКАЯ ДИССИПАЦИЯ В ТЕПЛО (МЕТОД ТЕНЗОРА НАПРЯЖЕНИЙ)
         # ==============================================================================
-        # Индикатор Колмогорова: срез верхних частот при градиентном шоке
-        sobolev_hyper_filter = 1e-5 * (radar_alert ** 3)
+        # Индикатор Колмогорова
+        sobolev_hyper_filter = 1e-3 * (radar_alert ** 3)  # Порог чувствительности увеличен
         adaptive_filter = torch.exp(-dt * sobolev_hyper_filter * (self.k_squared ** 2))
-
-        # Поле в Фурье после сжигания микровихрей
         v_fft_filtered = v_fft_proj * adaptive_filter
 
-        # ОБХОД ЛОВУШКИ ПАРСЕВАЛЯ: Возврат в реальное пространство для локализации энергии
-        v_proj_real = torch.fft.ifftn(v_fft_proj, dim=self.spatial_axes, norm="ortho").real
         v_filtered_real = torch.fft.ifftn(v_fft_filtered, dim=self.spatial_axes, norm="ortho").real
 
-        # Вычисление локального нагрева от сгоревших вихрей (в физических координатах)
-        kinetic_in = 0.5 * torch.sum(v_proj_real ** 2, dim=0)
-        kinetic_out = 0.5 * torch.sum(v_filtered_real ** 2, dim=0)
-        delta_T_heat = self.beta * torch.relu(kinetic_in - kinetic_out)
+        # ФИЗИЧЕСКИЙ НАГРЕВ: вычисляется через внутреннее трение тензора S
+        # Формула: Q = 2 * nu * S_ij * S_ij
+        viscous_dissipation = 2.0 * nu_total * (S_xx ** 2 + 2.0 * (S_xy ** 2) + S_yy ** 2)
+        delta_T_heat = self.beta * viscous_dissipation * dt
 
-        # Расчет градиентов температуры для адвекции (чтобы тепло двигалось с потоком)
-        # ИСПРАВЛЕНО: dim=(0, 1), так как self.T — это 2D тензор (N, N)
+        # Расчет градиентов температуры для адвекции тепла потоком
         T_fft = torch.fft.fftn(self.T, dim=(0, 1), norm="ortho")
         dTdx = torch.fft.ifftn(1j * self.mesh[0] * T_fft, norm="ortho").real
         dTdy = torch.fft.ifftn(1j * self.mesh[1] * T_fft, norm="ortho").real
 
-        # Конвективный перенос температуры векторным полем (отфильтрованным)
+        # Конвективный перенос температуры векторным полем
         advection_T = -(v_filtered_real[0] * dTdx + v_filtered_real[1] * dTdy)
 
-        # Охлаждение Ньютона (базовое) + Радиационное охлаждение для гашения пиков (T^4)
+        # Охлаждение Ньютона + Радиационное излучение
         cooling = self.sigma * (self.T - self.T0) + 1e-10 * (self.T ** 4 - self.T0 ** 4)
-        self.T = torch.relu(self.T + dt * advection_T + delta_T_heat - cooling * dt)
+
+        # Интегрирование теплового баланса
+        T_predicted = self.T + advection_T * dt + delta_T_heat - cooling * dt
+        T_predicted = torch.clamp(T_predicted, min=self.T0)  # Ограничение снизу базовой температурой среды
+
+        # Спектральная диффузия тепла (Теплопроводность)
+        T_fft_next = torch.fft.fftn(T_predicted, dim=(0, 1), norm="ortho")
+        thermal_diffusion_filter = torch.exp(-dt * self.kappa * self.k_squared)
+
+        self.T = torch.fft.ifftn(T_fft_next * thermal_diffusion_filter, norm="ortho").real
 
         return v_filtered_real, singularity_index
 
@@ -323,15 +398,17 @@ if __name__ == '__main__':
     grid_shape = (N, N)
 
     # Селектор профиля среды
-    env_name = "liquid_hydrogen"
+    env_name = "glycerin"
     env = ENV_PROFILES[env_name]
 
     engine = UltimateStableEngine(grid_shape, env, spatial_size=spatial_size)
+
     x = np.linspace(0, spatial_size, N)
     y = np.linspace(0, spatial_size, N)
     X, Y = np.meshgrid(x, y, indexing='xy')
 
     v_current = torch.zeros((2, N, N), device=engine.device)
+
     # Инициализация тангенциального сдвига скоростей
     u_field = torch.tanh((torch.tensor(Y, device=engine.device) - 5.0) / 0.5) * 3.0
     v_current[0] = u_field
@@ -351,19 +428,19 @@ if __name__ == '__main__':
     filenames = []
     pv.OFF_SCREEN = True
     n_steps = 8000
+
     pl = pv.Plotter(window_size=[1000, 800])
     pl.set_background('#0a0a0a')
 
     print(
         f"{'Step':<6} | {'Max Vel':<8} | {'Mean T':<8} | {'Max T':<8} | {'Max Vort':<10} | {'Enstrophy':<12} | {'Singul.':<8}")
     print("-" * 95)
-    sim_time = 0.0
 
+    sim_time = 0.0
     try:
         for s in range(n_steps):
             # Динамический шаг по времени (CFL Condition)
             max_vel_current = torch.max(torch.sqrt(v_current[0] ** 2 + v_current[1] ** 2)).item()
-            # Целевой Курант = 0.25 для жесткого удержания термодинамического шага
             dt = min(0.004, 0.25 * engine.dx / (max_vel_current + 1e-6))
 
             v_current, singularity_idx = engine.step(v_current, dt)
@@ -384,6 +461,7 @@ if __name__ == '__main__':
 
                 warp_factor = 3.0 / (max_w + 10.0)
                 grid_warp = grid.warp_by_scalar("vorticity", factor=warp_factor)
+
                 pl.clear()
                 vmax = np.percentile(np.abs(vorticity_np), 98)
                 if vmax < 1e-3:
@@ -392,7 +470,7 @@ if __name__ == '__main__':
                 pl.add_mesh(grid_warp, scalars="vorticity", cmap="RdBu", ambient=0.1, diffuse=0.8, specular=0.3,
                             show_edges=False, clim=[-vmax, vmax])
 
-                # Исправлено формирование заголовка
+                # Формирование заголовка
                 title_str = f"{env_name.replace('_', ' ').upper()} Flow + Thermal Loop"
                 pl.add_text(f"{title_str}\nStep: {s} | Time: {sim_time:.3f}s\nMax T: {max_T:.1f} K", color='white',
                             font_size=14)
